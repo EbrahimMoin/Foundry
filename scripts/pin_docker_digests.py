@@ -9,6 +9,8 @@ import urllib.request
 IMAGES: list[tuple[str, str]] = [
     ("pgvector/pgvector", "pg16"),
     ("monokal/tinyproxy", "latest"),
+    ("library/python", "3.12-slim"),
+    ("library/node", "22-slim"),
 ]
 
 ACCEPT_HEADER = ", ".join(

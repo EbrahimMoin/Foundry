@@ -67,3 +67,17 @@ def test_cli_init_list_assign_and_replay_test(tmp_path: Path) -> None:
     assert test_res.exit_code == 0
     assert "replayed=True" in test_res.stdout
     assert "cost_usd=$0.000000" in test_res.stdout
+
+
+def test_cli_stack_scaffold_and_sandbox_check(tmp_path: Path) -> None:
+    app_dir = tmp_path / "scaffolded"
+    res = runner.invoke(app, ["stack", "scaffold", str(app_dir), "--name", "demo-app"])
+    assert res.exit_code == 0
+    assert (app_dir / "backend" / "app" / "main.py").exists()
+    assert (app_dir / "frontend" / "src" / "app" / "AppLayout.tsx").exists()
+
+    chk = runner.invoke(app, ["sandbox", "check"])
+    # In WSL2 git & infra files exist; docker binary may or may not be present yet
+    assert "Daemon git binary:" in chk.stdout
+    assert "infra/docker-compose.yml: present" in chk.stdout
+    assert "infra/sandbox.Dockerfile: present" in chk.stdout

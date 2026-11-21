@@ -29,6 +29,7 @@ from foundry.gateway.cassette import CassetteStore, MissPolicy
 from foundry.gateway.protocol import GatewayRequest, GatewayResponse
 from foundry.gateway.router import ModelGateway
 from foundry.security.vault import CredentialVault, VaultError
+from foundry.stack_packs import get_stack_pack
 
 app = typer.Typer(
     name="foundry",
@@ -36,7 +37,11 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 models_app = typer.Typer(help="Inspect, configure, and test first-party SDK model providers.")
+stack_app = typer.Typer(help="Inspect and scaffold stack-pack Wave 0 skeletons.")
+sandbox_app = typer.Typer(help="Check sandbox runtime, Docker Engine, and workspace guards.")
 app.add_typer(models_app, name="models")
+app.add_typer(stack_app, name="stack")
+app.add_typer(sandbox_app, name="sandbox")
 
 console = Console()
 
@@ -310,3 +315,46 @@ def models_test(
         f"[green]Success[/green] provider={resp.provider_id} model={resp.model} "
         f"replayed={resp.replayed} cost_usd=${resp.cost_usd:.6f} content={resp.content!r}"
     )
+
+
+@stack_app.command("scaffold")
+def stack_scaffold(
+    target_dir: Annotated[Path, typer.Argument(help="Destination directory for Wave 0 app")],
+    name: Annotated[str, typer.Option(help="Application name")] = "app",
+    pack: Annotated[str, typer.Option(help="Stack pack name")] = "fastapi-react-postgres",
+) -> None:
+    """Materialize a Wave 0 skeleton using a Foundry StackPack."""
+    try:
+        stack_pack = get_stack_pack(pack)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    written = stack_pack.scaffold(target_dir, app_name=name)
+    console.print(
+        f"[green]Scaffolded[/green] {len(written)} files for '{name}' "
+        f"({stack_pack.name}) at {target_dir}"
+    )
+
+
+@sandbox_app.command("check")
+def sandbox_check(
+    infra_dir: Annotated[Path | None, typer.Option(help="Path to infra directory")] = None,
+) -> None:
+    """Verify Docker Engine availability, compose file, and sandbox Dockerfile readiness."""
+    infra = infra_dir or (Path.cwd() / "infra")
+    compose_ok = (infra / "docker-compose.yml").exists()
+    dockerfile_ok = (infra / "sandbox.Dockerfile").exists()
+    docker_bin = shutil.which("docker")
+    git_bin = shutil.which("git")
+
+    console.print(f"Daemon git binary: [cyan]{git_bin or 'missing'}[/cyan]")
+    console.print(f"Docker CLI binary: [cyan]{docker_bin or 'not installed in WSL2'}[/cyan]")
+    console.print(
+        f"infra/docker-compose.yml: [cyan]{'present' if compose_ok else 'missing'}[/cyan]"
+    )
+    console.print(
+        f"infra/sandbox.Dockerfile: [cyan]{'present' if dockerfile_ok else 'missing'}[/cyan]"
+    )
+    if not git_bin or not compose_ok or not dockerfile_ok:
+        raise typer.Exit(code=1)
