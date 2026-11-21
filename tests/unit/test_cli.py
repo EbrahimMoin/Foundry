@@ -1,0 +1,69 @@
+"""CLI smoke tests running offline at $0 API cost."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from foundry.cli.main import app
+
+runner = CliRunner()
+
+
+def test_cli_help() -> None:
+    res = runner.invoke(app, ["--help"])
+    assert res.exit_code == 0
+    assert "Foundry" in res.stdout
+
+
+def test_cli_init_list_assign_and_replay_test(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "config"
+    proj_dir = tmp_path / "project"
+
+    init_res = runner.invoke(
+        app,
+        [
+            "init",
+            "--config-dir",
+            str(cfg_dir),
+            "--project-dir",
+            str(proj_dir),
+            "--name",
+            "bookmarks",
+        ],
+    )
+    assert init_res.exit_code == 0
+    assert (cfg_dir / "foundry.yaml").exists()
+    assert (cfg_dir / "models.yaml").exists()
+    assert (proj_dir / ".foundry" / "project.yaml").exists()
+
+    list_res = runner.invoke(app, ["models", "list", "--config-dir", str(cfg_dir)])
+    assert list_res.exit_code == 0
+    assert "openai_compat" in list_res.stdout
+    assert "google_genai" in list_res.stdout
+    assert "anthropic" in list_res.stdout
+    assert "litellm" not in list_res.stdout.lower()
+
+    assign_res = runner.invoke(
+        app,
+        ["models", "assign", "implementer", "@coder_deepseek", "--config-dir", str(cfg_dir)],
+    )
+    assert assign_res.exit_code == 0
+    assert "@coder_deepseek" in (cfg_dir / "models.yaml").read_text(encoding="utf-8")
+
+    test_res = runner.invoke(
+        app,
+        [
+            "models",
+            "test",
+            "--replay",
+            "--cassette-dir",
+            "tests/cassettes",
+            "--config-dir",
+            str(cfg_dir),
+        ],
+    )
+    assert test_res.exit_code == 0
+    assert "replayed=True" in test_res.stdout
+    assert "cost_usd=$0.000000" in test_res.stdout

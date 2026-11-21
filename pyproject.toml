@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "foundry-dev"
+version = "0.1.0"
+description = "Open-source, local-first, contract-first multi-agent software engineering environment"
+readme = "foundry_design_document.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "anthropic>=0.40",
+    "cryptography>=43.0",
+    "google-genai>=1.0",
+    "httpx>=0.27",
+    "keyring>=25.0",
+    "langchain-core>=0.3",
+    "openai>=1.50",
+    "pydantic>=2.7",
+    "python-ulid>=2.7",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+    "types-pyyaml>=6.0",
+]
+
+[project.scripts]
+foundry = "foundry.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["packages/foundry"]
+
+[tool.uv]
+# Minimum PyPI release-age cooldown (A7-1 supply-chain protection)
+exclude-newer = "7 days"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["packages", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "packages"
+packages = ["foundry"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+pythonpath = ["packages"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live_llm: hits live external LLM APIs (skipped in offline CI)",
+]

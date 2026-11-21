@@ -1,0 +1,23 @@
+# Python & tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local secrets & encrypted vault
+.env
+.env.*
+*.enc
+credentials.enc
+
+# Foundry runtime state
+.foundry/worktrees/
+.foundry/workspaces/
+.foundry/logs/
+*.db

@@ -1,0 +1,18 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-flash-lite",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "OK",
+  "tool_calls": [],
+  "tokens_in": 18,
+  "tokens_cached": 10,
+  "tokens_out": 2,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "cli-smoke-fixture",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}

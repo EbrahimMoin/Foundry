@@ -1,0 +1,63 @@
+# Local Foundry control-plane infrastructure (Postgres-only in v1; no Redis)
+# All container images are pinned by immutable sha256 digest (A7-1).
+# Re-verify digests with: python3 scripts/pin_docker_digests.py
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
+    container_name: foundry-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${FOUNDRY_PG_USER:-foundry}
+      POSTGRES_PASSWORD: ${FOUNDRY_PG_PASSWORD:-foundry_local_dev}
+      POSTGRES_DB: foundry_blackboard
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "max_connections=100"
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - foundry_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - foundry_control
+      - foundry_sandbox_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${FOUNDRY_PG_USER:-foundry} -d foundry_blackboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  egress-proxy:
+    # Default-deny HTTP(S) proxy for approved sandbox package installs only.
+    # Bypass stock wrapper entrypoint so it never attempts sed on read-only mounted config.
+    image: monokal/tinyproxy@sha256:2c1b6f187fe18a993ec6e88cdb12c8f1d28d7416bd73492289aa5f74f687c672
+    container_name: foundry-egress-proxy
+    restart: unless-stopped
+    entrypoint: ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+    volumes:
+      - ./tinyproxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./tinyproxy/filter:/etc/tinyproxy/filter:ro
+    networks:
+      - foundry_sandbox_egress
+      - foundry_proxy_wan
+    mem_limit: 64m
+    cpus: 0.25
+
+volumes:
+  foundry_pgdata:
+
+networks:
+  foundry_control:
+    driver: bridge
+  foundry_sandbox_db:
+    driver: bridge
+    internal: true
+  foundry_sandbox_egress:
+    driver: bridge
+    internal: true
+  foundry_proxy_wan:
+    driver: bridge
