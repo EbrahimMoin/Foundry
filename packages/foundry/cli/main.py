@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from foundry.agents.single import ReplayMockSandboxProvider, SingleAgentRunner
 from foundry.config.loader import (
     CONFIG_DIR_DEFAULT,
     ConfigError,
@@ -24,10 +27,11 @@ from foundry.config.loader import (
     save_models_config,
     save_project_config,
 )
-from foundry.config.schemas import ModelsConfig
+from foundry.config.schemas import BudgetConfig, ModelsConfig
 from foundry.gateway.cassette import CassetteStore, MissPolicy
 from foundry.gateway.protocol import GatewayRequest, GatewayResponse
 from foundry.gateway.router import ModelGateway
+from foundry.sandbox import HeavyExecSemaphore, LocalDockerProvider, SandboxProvider
 from foundry.security.vault import CredentialVault, VaultError
 from foundry.stack_packs import get_stack_pack
 
@@ -39,9 +43,11 @@ app = typer.Typer(
 models_app = typer.Typer(help="Inspect, configure, and test first-party SDK model providers.")
 stack_app = typer.Typer(help="Inspect and scaffold stack-pack Wave 0 skeletons.")
 sandbox_app = typer.Typer(help="Check sandbox runtime, Docker Engine, and workspace guards.")
+bench_app = typer.Typer(help="Run foundry-bench baselines and evaluation suites.")
 app.add_typer(models_app, name="models")
 app.add_typer(stack_app, name="stack")
 app.add_typer(sandbox_app, name="sandbox")
+app.add_typer(bench_app, name="bench")
 
 console = Console()
 
@@ -356,5 +362,277 @@ def sandbox_check(
     console.print(
         f"infra/sandbox.Dockerfile: [cyan]{'present' if dockerfile_ok else 'missing'}[/cyan]"
     )
+
+    if docker_bin:
+        info_res = subprocess.run(  # noqa: S603
+            [docker_bin, "info", "--format", "{{.ServerVersion}}"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        daemon_state = (
+            f"connected (v{info_res.stdout.strip()})"
+            if info_res.returncode == 0
+            else f"unavailable ({info_res.stderr.strip() or 'not running'})"
+        )
+        console.print(f"Docker Engine daemon: [cyan]{daemon_state}[/cyan]")
+        img_name = "foundry-sandbox-fastapi-react:local"
+        img_res = subprocess.run(  # noqa: S603
+            [docker_bin, "image", "inspect", img_name],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        console.print(
+            f"Sandbox image ({img_name}): "
+            f"[cyan]{'built' if img_res.returncode == 0 else 'not built yet'}[/cyan]"
+        )
+
     if not git_bin or not compose_ok or not dockerfile_ok:
+        raise typer.Exit(code=1)
+
+
+def _resolve_sandbox_provider(
+    sandbox_mode: Literal["auto", "docker", "replay-mock"],
+    *,
+    replay: bool,
+    runtime_cfg: Any,
+) -> SandboxProvider:
+    if sandbox_mode == "replay-mock":
+        if not replay:
+            console.print("[red]'--sandbox replay-mock' is only allowed with '--replay'.[/red]")
+            raise typer.Exit(code=1)
+        return ReplayMockSandboxProvider()
+
+    if sandbox_mode == "docker":
+        if not shutil.which("docker"):
+            console.print("[red]Docker binary not found on PATH for '--sandbox docker'.[/red]")
+            raise typer.Exit(code=1)
+        return LocalDockerProvider(
+            runtime_cfg,
+            HeavyExecSemaphore(runtime_cfg.max_heavy_exec_slots),
+        )
+
+    if replay:
+        return ReplayMockSandboxProvider()
+    if shutil.which("docker"):
+        return LocalDockerProvider(
+            runtime_cfg,
+            HeavyExecSemaphore(runtime_cfg.max_heavy_exec_slots),
+        )
+    console.print("[red]Docker binary not found.[/red] Enable Docker in WSL2 or pass '--replay'.")
+    raise typer.Exit(code=1)
+
+
+def _load_b1_runner_cls() -> Any:
+    cwd_str = str(Path.cwd())
+    if (Path.cwd() / "bench").is_dir() and cwd_str not in sys.path:
+        sys.path.insert(0, cwd_str)
+    try:
+        mod = importlib.import_module("bench.runner.b1_runner")
+    except ModuleNotFoundError as exc:
+        console.print(
+            f"[red]Cannot locate benchmark runner package ('bench'):[/red] {exc}. "
+            "Run from the Foundry repository root."
+        )
+        raise typer.Exit(code=1) from exc
+    return mod.B1BenchmarkRunner
+
+
+@app.command("build")
+def build_app(
+    spec: Annotated[str, typer.Argument(help="App specification text or path to a spec .md file")],
+    target_dir: Annotated[
+        Path,
+        typer.Option(help="Output root for repo, worktree, and sandbox workspace"),
+    ] = Path("tmp/foundry-build"),
+    name: Annotated[str, typer.Option(help="Application name")] = "foundry-app",
+    spec_dir: Annotated[
+        Path | None,
+        typer.Option(help="Optional directory with pinned_openapi.yaml and pinned_testids.yaml"),
+    ] = None,
+    config_dir: Annotated[Path, typer.Option()] = CONFIG_DIR_DEFAULT,
+    replay: Annotated[
+        bool,
+        typer.Option("--replay", help="Replay LLM turns from normalized $0 cassettes"),
+    ] = False,
+    sandbox: Annotated[
+        Literal["auto", "docker", "replay-mock"],
+        typer.Option(help="Sandbox backend ('auto', 'docker', or offline 'replay-mock')"),
+    ] = "auto",
+    cassette_dir: Annotated[
+        Path,
+        typer.Option(help="Directory containing normalized cassettes"),
+    ] = Path("tests/cassettes"),
+    max_steps: Annotated[int, typer.Option(min=1, max=100)] = 25,
+    max_attempts: Annotated[int, typer.Option(min=1, max=5)] = 3,
+    budget_usd: Annotated[float, typer.Option(min=0.0)] = 2.00,
+    passphrase: Annotated[
+        str | None,
+        typer.Option(help="Vault passphrase if using encrypted_vault"),
+    ] = None,
+    run_schemathesis: Annotated[bool, typer.Option()] = True,
+) -> None:
+    """Build and G1/G2-verify a full-stack app using SingleAgentBuilder (v0.1)."""
+    models_cfg = _load_or_default_models(config_dir)
+    global_cfg = (
+        load_foundry_config(config_dir / "foundry.yaml")
+        if (config_dir / "foundry.yaml").exists()
+        else default_foundry_config()
+    )
+    spec_path = Path(spec)
+    spec_text = spec_path.read_text(encoding="utf-8") if spec_path.is_file() else spec
+    provider = _resolve_sandbox_provider(
+        sandbox,
+        replay=replay,
+        runtime_cfg=global_cfg.runtime,
+    )
+    cassettes = CassetteStore(cassette_dir, miss_policy=MissPolicy.STRICT) if replay else None
+    vault = CredentialVault(
+        vault_path=Path(global_cfg.secrets.vault_path),
+        passphrase=passphrase,
+        backend_order=global_cfg.secrets.backend_order,
+    )
+    budget_cfg = BudgetConfig(per_run_usd=budget_usd)
+    budget_cfg = budget_cfg.model_copy(
+        update={"per_task": budget_cfg.per_task.model_copy(update={"implement_usd": budget_usd})}
+    )
+
+    pinned_openapi = (spec_dir / "pinned_openapi.yaml") if spec_dir else None
+    pinned_testids = (spec_dir / "pinned_testids.yaml") if spec_dir else None
+    runner_obj = SingleAgentRunner(
+        models_cfg=models_cfg,
+        runtime_cfg=global_cfg.runtime,
+        budget_cfg=budget_cfg,
+        vault=vault,
+        cassettes=cassettes,
+        sandbox_provider=provider,
+    )
+    result = asyncio.run(
+        runner_obj.run(
+            spec=spec_text,
+            target_dir=target_dir,
+            app_name=name,
+            task_slug=name,
+            pinned_openapi_path=pinned_openapi
+            if pinned_openapi and pinned_openapi.exists()
+            else None,
+            pinned_testids_path=pinned_testids
+            if pinned_testids and pinned_testids.exists()
+            else None,
+            max_steps=max_steps,
+            max_attempts=max_attempts,
+            run_schemathesis=run_schemathesis,
+        )
+    )
+
+    table = Table(title=f"Foundry Build Result ({name})")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value")
+    table.add_row("Status", result.status)
+    table.add_row("G2 Passed", str(result.g2_passed))
+    table.add_row("Steps / Attempts", f"{result.steps} / {result.attempts}")
+    table.add_row("LLM Calls", str(result.llm_calls))
+    table.add_row("Cost (USD)", f"${result.cost_usd:.6f}")
+    table.add_row("Committed SHA", result.committed_sha or "none")
+    table.add_row("Workspace", str(result.workspace_dir))
+    console.print(table)
+    if result.error:
+        console.print(f"[red]Error:[/red]\n{result.error}")
+    if result.status != "passed":
+        raise typer.Exit(code=1)
+
+
+@bench_app.command("run-b1")
+def bench_run_b1(
+    spec_dir: Annotated[
+        Path,
+        typer.Option("--spec", help="Benchmark spec directory containing spec.md"),
+    ] = Path("bench/specs/s1_bookmarks"),
+    out_dir: Annotated[
+        Path,
+        typer.Option(help="Output directory for build artifacts and result.json"),
+    ] = Path("tmp/bench_b1"),
+    config_dir: Annotated[Path, typer.Option()] = CONFIG_DIR_DEFAULT,
+    replay: Annotated[
+        bool,
+        typer.Option("--replay", help="Replay LLM turns from normalized $0 cassettes"),
+    ] = False,
+    sandbox: Annotated[
+        Literal["auto", "docker", "replay-mock"],
+        typer.Option(help="Sandbox backend ('auto', 'docker', or offline 'replay-mock')"),
+    ] = "auto",
+    cassette_dir: Annotated[
+        Path,
+        typer.Option(help="Directory containing normalized cassettes"),
+    ] = Path("tests/cassettes"),
+    budget_usd: Annotated[float, typer.Option(min=0.0)] = 1.50,
+    max_steps: Annotated[int, typer.Option(min=1, max=100)] = 25,
+    run_hidden_tests: Annotated[
+        bool,
+        typer.Option(help="Run isolated hidden API acceptance tests inside Docker"),
+    ] = True,
+    passphrase: Annotated[
+        str | None,
+        typer.Option(help="Vault passphrase if using encrypted_vault"),
+    ] = None,
+) -> None:
+    """Run Baseline B1 (Single-Agent Equal-Budget) against a foundry-bench spec."""
+    models_cfg = _load_or_default_models(config_dir)
+    global_cfg = (
+        load_foundry_config(config_dir / "foundry.yaml")
+        if (config_dir / "foundry.yaml").exists()
+        else default_foundry_config()
+    )
+    provider = _resolve_sandbox_provider(
+        sandbox,
+        replay=replay,
+        runtime_cfg=global_cfg.runtime,
+    )
+    cassettes = CassetteStore(cassette_dir, miss_policy=MissPolicy.STRICT) if replay else None
+    vault = CredentialVault(
+        vault_path=Path(global_cfg.secrets.vault_path),
+        passphrase=passphrase,
+        backend_order=global_cfg.secrets.backend_order,
+    )
+    runner_cls = _load_b1_runner_cls()
+    b1_runner = runner_cls(
+        models_cfg=models_cfg,
+        runtime_cfg=global_cfg.runtime,
+        vault=vault,
+        cassettes=cassettes,
+        sandbox_provider=provider,
+    )
+    result = asyncio.run(
+        b1_runner.run(
+            spec_dir=spec_dir,
+            out_dir=out_dir,
+            budget_usd=budget_usd,
+            max_steps=max_steps,
+            run_hidden_tests=run_hidden_tests,
+        )
+    )
+
+    table = Table(title=f"foundry-bench B1 ({result.spec_id})")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value")
+    table.add_row("Status", result.status)
+    table.add_row("G2 Passed", str(result.g2_passed))
+    table.add_row(
+        "Hidden API Suite",
+        (
+            f"{result.hidden_api_passed}/{result.hidden_api_total} "
+            f"({result.hidden_api_pass_rate * 100:.1f}%)"
+            if result.hidden_api_ran
+            else "skipped (replay-mock)"
+        ),
+    )
+    table.add_row("Cost (USD)", f"${result.cost_usd:.6f}")
+    table.add_row("LLM Calls", str(result.llm_calls))
+    table.add_row("Benchmark Pin Models", str(result.benchmark_pin_models))
+    table.add_row("Report JSON", str(out_dir / "result.json"))
+    console.print(table)
+    if result.error:
+        console.print(f"[red]Error:[/red]\n{result.error}")
+    if result.status != "passed":
         raise typer.Exit(code=1)

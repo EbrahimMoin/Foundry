@@ -12,7 +12,7 @@ COPY --from=node_stage /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
     && corepack enable \
-    && corepack prepare pnpm@latest --activate
+    && corepack prepare pnpm@9.15.4 --activate
 
 # Install uv and pre-bake standard stack-pack Python check/runtime tooling
 RUN pip install --no-cache-dir \
@@ -26,6 +26,12 @@ RUN pip install --no-cache-dir \
     sqlalchemy \
     alembic \
     pydantic \
+    pydantic-settings \
+    pyjwt \
+    asyncpg \
+    pyyaml \
+    uvicorn \
+    email-validator \
     schemathesis
 
 # Create non-root sandbox user (uid 1000) with no git installed
@@ -37,6 +43,11 @@ RUN groupadd --gid 1000 foundry \
 ENV HOME=/home/foundry \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace/backend \
+    MYPYPATH=/workspace/backend \
+    RUFF_CACHE_DIR=/tmp/.ruff_cache \
+    MYPY_CACHE_DIR=/tmp/.mypy_cache \
+    PYTHONPYCACHEPREFIX=/tmp/__pycache__ \
     NODE_OPTIONS="--max-old-space-size=768"
 
 USER 1000:1000

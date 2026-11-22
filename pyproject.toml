@@ -18,6 +18,7 @@ dependencies = [
     "httpx>=0.27",
     "keyring>=25.0",
     "langchain-core>=0.3",
+    "langgraph>=0.3",
     "mcp>=1.2",
     "openai>=1.50",
     "pydantic>=2.7",
@@ -49,7 +50,7 @@ exclude-newer = "7 days"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["packages", "tests", "scripts"]
+src = ["packages", "tests", "scripts", "bench"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC", "S"]
@@ -72,7 +73,7 @@ module = ["asyncpg", "docker"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-pythonpath = ["packages"]
+pythonpath = ["packages", "."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

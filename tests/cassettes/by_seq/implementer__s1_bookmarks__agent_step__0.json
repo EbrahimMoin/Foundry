@@ -1,0 +1,75 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-flash-lite",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "Implementing Auth, Bookmarks, and Tags backend modules plus unit tests.",
+  "tool_calls": [
+    {
+      "id": "call_s1_01",
+      "name": "write_file",
+      "args": {
+        "path": "backend/app/features/auth/__init__.py",
+        "content": ""
+      }
+    },
+    {
+      "id": "call_s1_02",
+      "name": "write_file",
+      "args": {
+        "path": "backend/app/features/auth/router.py",
+        "content": "from __future__ import annotations\n\nimport hashlib\nimport hmac\nimport secrets\nimport uuid\nfrom typing import Annotated\n\nfrom fastapi import APIRouter, Depends, HTTPException, status\nfrom fastapi.security import HTTPAuthorizationCredentials, HTTPBearer\nfrom pydantic import BaseModel, Field\n\nrouter = APIRouter(prefix=\"/auth\", tags=[\"auth\"])\n\n_SECRET = secrets.token_bytes(32)\n_USERS_BY_EMAIL: dict[str, dict[str, str]] = {}\n_TOKENS: dict[str, dict[str, str]] = {}\n\nbearer_scheme = HTTPBearer(auto_error=False, scheme_name=\"bearerAuth\")\n\n\nclass RegisterRequest(BaseModel):\n    email: str = Field(min_length=1)\n    password: str = Field(min_length=1)\n    name: str = Field(min_length=1)\n\n\nclass LoginRequest(BaseModel):\n    email: str = Field(min_length=1)\n    password: str = Field(min_length=1)\n\n\nclass UserResponse(BaseModel):\n    id: str\n    email: str\n    name: str\n\n\nclass TokenResponse(BaseModel):\n    access_token: str\n    token_type: str\n\n\ndef _hash_password(password: str, salt: str) -> str:\n    digest = hashlib.pbkdf2_hmac(\n        \"sha256\", password.encode(\"utf-8\"), salt.encode(\"utf-8\"), 10_000\n    )\n    return f\"{salt}:{digest.hex()}\"\n\n\ndef _verify_password(password: str, stored: str) -> bool:\n    salt, _, expected = stored.partition(\":\")\n    if not salt or not expected:\n        return False\n    candidate = _hash_password(password, salt)\n    return hmac.compare_digest(candidate, stored)\n\n\nasync def get_authenticated_user(\n    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],\n) -> dict[str, str]:\n    if creds is None or not creds.credentials:\n        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=\"Not authenticated\")\n    user = _TOKENS.get(creds.credentials)\n    if user is None:\n        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=\"Invalid token\")\n    return user\n\n\n@router.post(\n    \"/register\",\n    status_code=status.HTTP_201_CREATED,\n    response_model=UserResponse,\n    responses={409: {\"description\": \"Email already registered\"}},\n    openapi_extra={\"security\": []},\n)\nasync def register_user(payload: RegisterRequest) -> UserResponse:\n    email_key = payload.email.strip().lower()\n    if email_key in _USERS_BY_EMAIL:\n        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=\"Email already exists\")\n    user_id = f\"usr_{uuid.uuid4().hex[:12]}\"\n    salt = secrets.token_hex(8)\n    _USERS_BY_EMAIL[email_key] = {\n        \"id\": user_id,\n        \"email\": email_key,\n        \"name\": payload.name,\n        \"password_hash\": _hash_password(payload.password, salt),\n    }\n    return UserResponse(id=user_id, email=email_key, name=payload.name)\n\n\n@router.post(\n    \"/login\",\n    response_model=TokenResponse,\n    responses={401: {\"description\": \"Invalid credentials\"}},\n    openapi_extra={\"security\": []},\n)\nasync def login_user(payload: LoginRequest) -> TokenResponse:\n    email_key = payload.email.strip().lower()\n    user = _USERS_BY_EMAIL.get(email_key)\n    if user is None or not _verify_password(payload.password, user[\"password_hash\"]):\n        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=\"Invalid credentials\")\n    sig = hmac.new(_SECRET, f\"{user['id']}:{secrets.token_hex(8)}\".encode(\"utf-8\"), \"sha256\")\n    token = sig.hexdigest()\n    public_user = {\"id\": user[\"id\"], \"email\": user[\"email\"], \"name\": user[\"name\"]}\n    _TOKENS[token] = public_user\n    return TokenResponse(access_token=token, token_type=\"bearer\")\n\n\n@router.get(\n    \"/me\",\n    response_model=UserResponse,\n    responses={401: {\"description\": \"Not authenticated\"}},\n)\nasync def get_me(\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n) -> UserResponse:\n    return UserResponse(id=user[\"id\"], email=user[\"email\"], name=user[\"name\"])\n"
+      }
+    },
+    {
+      "id": "call_s1_03",
+      "name": "write_file",
+      "args": {
+        "path": "backend/app/features/bookmarks/__init__.py",
+        "content": ""
+      }
+    },
+    {
+      "id": "call_s1_04",
+      "name": "write_file",
+      "args": {
+        "path": "backend/app/features/bookmarks/router.py",
+        "content": "from __future__ import annotations\n\nimport uuid\nfrom typing import Annotated, Any\n\nfrom fastapi import APIRouter, Depends, HTTPException, Query, Response, status\nfrom pydantic import BaseModel, Field, field_validator\n\nfrom app.features.auth.router import get_authenticated_user\n\nrouter = APIRouter(prefix=\"/bookmarks\", tags=[\"bookmarks\"])\n\n_BOOKMARKS: dict[str, dict[str, Any]] = {}\n\n\ndef _validate_http_url(value: str) -> str:\n    cleaned = value.strip()\n    if not (cleaned.startswith(\"http://\") or cleaned.startswith(\"https://\")):\n        raise ValueError(\"url must start with http:// or https://\")\n    return cleaned\n\n\nclass BookmarkCreate(BaseModel):\n    url: str\n    title: str = Field(min_length=1)\n    description: str = \"\"\n    tags: list[str] = Field(default_factory=list)\n\n    @field_validator(\"url\")\n    @classmethod\n    def _check_url(cls, v: str) -> str:\n        return _validate_http_url(v)\n\n\nclass BookmarkUpdate(BaseModel):\n    url: str | None = None\n    title: str | None = Field(default=None, min_length=1)\n    description: str | None = None\n    tags: list[str] | None = None\n\n    @field_validator(\"url\")\n    @classmethod\n    def _check_url(cls, v: str | None) -> str | None:\n        if v is None:\n            return None\n        return _validate_http_url(v)\n\n\nclass BookmarkResponse(BaseModel):\n    id: str\n    url: str\n    title: str\n    description: str\n    tags: list[str]\n\n\nclass BookmarkPage(BaseModel):\n    items: list[BookmarkResponse]\n    total: int\n    page: int\n    size: int\n\n\ndef _to_response(record: dict[str, Any]) -> BookmarkResponse:\n    return BookmarkResponse(\n        id=str(record[\"id\"]),\n        url=str(record[\"url\"]),\n        title=str(record[\"title\"]),\n        description=str(record.get(\"description\", \"\")),\n        tags=[str(t) for t in record.get(\"tags\", [])],\n    )\n\n\n@router.post(\n    \"\",\n    status_code=status.HTTP_201_CREATED,\n    response_model=BookmarkResponse,\n    responses={401: {\"description\": \"Not authenticated\"}},\n)\nasync def create_bookmark(\n    payload: BookmarkCreate,\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n) -> BookmarkResponse:\n    bm_id = f\"bm_{uuid.uuid4().hex[:12]}\"\n    clean_tags = [t.strip() for t in payload.tags if t.strip()]\n    record: dict[str, Any] = {\n        \"id\": bm_id,\n        \"user_id\": user[\"id\"],\n        \"url\": payload.url,\n        \"title\": payload.title,\n        \"description\": payload.description,\n        \"tags\": clean_tags,\n    }\n    _BOOKMARKS[bm_id] = record\n    return _to_response(record)\n\n\n@router.get(\n    \"\",\n    response_model=BookmarkPage,\n    responses={401: {\"description\": \"Not authenticated\"}},\n)\nasync def list_bookmarks(\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n    q: str | None = None,\n    tag: str | None = None,\n    page: Annotated[int, Query(ge=1)] = 1,\n    size: Annotated[int, Query(ge=1, le=100)] = 20,\n) -> BookmarkPage:\n    owned = [b for b in _BOOKMARKS.values() if b[\"user_id\"] == user[\"id\"]]\n    if q:\n        needle = q.strip().lower()\n        owned = [\n            b\n            for b in owned\n            if needle in str(b[\"title\"]).lower()\n            or needle in str(b[\"url\"]).lower()\n            or needle in str(b.get(\"description\", \"\")).lower()\n        ]\n    if tag:\n        owned = [b for b in owned if tag in b.get(\"tags\", [])]\n\n    total = len(owned)\n    start = (page - 1) * size\n    sliced = [_to_response(b) for b in owned[start : start + size]]\n    return BookmarkPage(items=sliced, total=total, page=page, size=size)\n\n\n@router.get(\n    \"/{bookmark_id}\",\n    response_model=BookmarkResponse,\n    responses={401: {\"description\": \"Not authenticated\"}, 404: {\"description\": \"Not found\"}},\n)\nasync def get_bookmark(\n    bookmark_id: str,\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n) -> BookmarkResponse:\n    record = _BOOKMARKS.get(bookmark_id)\n    if record is None or record[\"user_id\"] != user[\"id\"]:\n        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=\"Bookmark not found\")\n    return _to_response(record)\n\n\n@router.patch(\n    \"/{bookmark_id}\",\n    response_model=BookmarkResponse,\n    responses={401: {\"description\": \"Not authenticated\"}, 404: {\"description\": \"Not found\"}},\n)\nasync def update_bookmark(\n    bookmark_id: str,\n    payload: BookmarkUpdate,\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n) -> BookmarkResponse:\n    record = _BOOKMARKS.get(bookmark_id)\n    if record is None or record[\"user_id\"] != user[\"id\"]:\n        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=\"Bookmark not found\")\n    if payload.url is not None:\n        record[\"url\"] = payload.url\n    if payload.title is not None:\n        record[\"title\"] = payload.title\n    if payload.description is not None:\n        record[\"description\"] = payload.description\n    if payload.tags is not None:\n        record[\"tags\"] = [t.strip() for t in payload.tags if t.strip()]\n    return _to_response(record)\n\n\n@router.delete(\n    \"/{bookmark_id}\",\n    status_code=status.HTTP_204_NO_CONTENT,\n    responses={401: {\"description\": \"Not authenticated\"}, 404: {\"description\": \"Not found\"}},\n)\nasync def delete_bookmark(\n    bookmark_id: str,\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n) -> Response:\n    record = _BOOKMARKS.get(bookmark_id)\n    if record is None or record[\"user_id\"] != user[\"id\"]:\n        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=\"Bookmark not found\")\n    del _BOOKMARKS[bookmark_id]\n    return Response(status_code=status.HTTP_204_NO_CONTENT)\n"
+      }
+    },
+    {
+      "id": "call_s1_05",
+      "name": "write_file",
+      "args": {
+        "path": "backend/app/features/tags/__init__.py",
+        "content": ""
+      }
+    },
+    {
+      "id": "call_s1_06",
+      "name": "write_file",
+      "args": {
+        "path": "backend/app/features/tags/router.py",
+        "content": "from __future__ import annotations\n\nfrom collections import Counter\nfrom typing import Annotated\n\nfrom fastapi import APIRouter, Depends\nfrom pydantic import BaseModel\n\nfrom app.features.auth.router import get_authenticated_user\nfrom app.features.bookmarks.router import _BOOKMARKS\n\nrouter = APIRouter(prefix=\"/tags\", tags=[\"tags\"])\n\n\nclass TagCount(BaseModel):\n    name: str\n    count: int\n\n\nclass TagListResponse(BaseModel):\n    items: list[TagCount]\n\n\n@router.get(\n    \"\",\n    response_model=TagListResponse,\n    responses={401: {\"description\": \"Not authenticated\"}},\n)\nasync def list_tags(\n    user: Annotated[dict[str, str], Depends(get_authenticated_user)],\n) -> TagListResponse:\n    counts: Counter[str] = Counter()\n    for record in _BOOKMARKS.values():\n        if record[\"user_id\"] == user[\"id\"]:\n            for tag in record.get(\"tags\", []):\n                counts[str(tag)] += 1\n    items = [TagCount(name=k, count=counts[k]) for k in sorted(counts)]\n    return TagListResponse(items=items)\n"
+      }
+    },
+    {
+      "id": "call_s1_07",
+      "name": "write_file",
+      "args": {
+        "path": "backend/tests/test_bookmarks.py",
+        "content": "from __future__ import annotations\n\nimport uuid\n\nimport httpx\n\n\nasync def test_whitebox_bookmarks_flow(client: httpx.AsyncClient) -> None:\n    email = f\"unit_{uuid.uuid4().hex[:8]}@example.com\"\n    reg = await client.post(\n        \"/api/auth/register\",\n        json={\"email\": email, \"password\": \"pass1234\", \"name\": \"Unit\"},\n    )\n    assert reg.status_code == 201\n\n    login = await client.post(\n        \"/api/auth/login\",\n        json={\"email\": email, \"password\": \"pass1234\"},\n    )\n    assert login.status_code == 200\n    headers = {\"Authorization\": f\"Bearer {login.json()['access_token']}\"}\n\n    created = await client.post(\n        \"/api/bookmarks\",\n        headers=headers,\n        json={\"url\": \"https://example.org\", \"title\": \"Example\", \"tags\": [\"ref\"]},\n    )\n    assert created.status_code == 201\n\n    tags = await client.get(\"/api/tags\", headers=headers)\n    assert tags.status_code == 200\n    assert tags.json()[\"items\"] == [{\"name\": \"ref\", \"count\": 1}]\n"
+      }
+    }
+  ],
+  "tokens_in": 1200,
+  "tokens_cached": 600,
+  "tokens_out": 850,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "s1-bookmarks-step-0",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}

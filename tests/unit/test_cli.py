@@ -81,3 +81,75 @@ def test_cli_stack_scaffold_and_sandbox_check(tmp_path: Path) -> None:
     assert "Daemon git binary:" in chk.stdout
     assert "infra/docker-compose.yml: present" in chk.stdout
     assert "infra/sandbox.Dockerfile: present" in chk.stdout
+
+
+def test_cli_build_and_bench_b1_replay_offline(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "cfg"
+    proj_dir = tmp_path / "proj"
+    assert (
+        runner.invoke(
+            app,
+            ["init", "--config-dir", str(cfg_dir), "--project-dir", str(proj_dir), "--name", "s1"],
+        ).exit_code
+        == 0
+    )
+
+    build_dir = tmp_path / "cli_build"
+    build_res = runner.invoke(
+        app,
+        [
+            "build",
+            "bench/specs/s1_bookmarks/spec.md",
+            "--name",
+            "s1_bookmarks",
+            "--spec-dir",
+            "bench/specs/s1_bookmarks",
+            "--target-dir",
+            str(build_dir),
+            "--config-dir",
+            str(cfg_dir),
+            "--replay",
+            "--sandbox",
+            "replay-mock",
+            "--cassette-dir",
+            "tests/cassettes",
+        ],
+    )
+    assert build_res.exit_code == 0, build_res.stdout
+    assert "passed" in build_res.stdout
+
+    # replay-mock without --replay must be rejected
+    bad_res = runner.invoke(
+        app,
+        [
+            "build",
+            "Build something",
+            "--sandbox",
+            "replay-mock",
+            "--config-dir",
+            str(cfg_dir),
+        ],
+    )
+    assert bad_res.exit_code != 0
+
+    bench_dir = tmp_path / "cli_bench"
+    bench_res = runner.invoke(
+        app,
+        [
+            "bench",
+            "run-b1",
+            "--spec",
+            "bench/specs/s1_bookmarks",
+            "--out-dir",
+            str(bench_dir),
+            "--config-dir",
+            str(cfg_dir),
+            "--replay",
+            "--sandbox",
+            "replay-mock",
+            "--cassette-dir",
+            "tests/cassettes",
+        ],
+    )
+    assert bench_res.exit_code == 0, bench_res.stdout
+    assert (bench_dir / "result.json").is_file()

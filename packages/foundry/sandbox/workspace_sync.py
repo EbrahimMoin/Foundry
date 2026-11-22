@@ -17,14 +17,29 @@ from foundry.security.workspace_guard import (
     validate_workspace_tree,
 )
 
+_IGNORED_CACHE_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".hypothesis",
+        ".foundry_tmp",
+        "node_modules",
+    }
+)
+
 
 def _file_hashes(root: Path, *, ignore_git: bool) -> dict[str, str]:
     """Return mapping of normalized relative file path -> SHA-256 hex digest."""
     hashes: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         current = Path(dirpath)
-        if ignore_git and current == root and ".git" in dirnames:
-            dirnames.remove(".git")
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _IGNORED_CACHE_DIRS and not (ignore_git and current == root and d == ".git")
+        ]
         if ignore_git and current == root and ".git" in filenames:
             filenames.remove(".git")
         for fname in filenames:

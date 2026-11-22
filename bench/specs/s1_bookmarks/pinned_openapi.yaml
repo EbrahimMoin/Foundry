@@ -1,0 +1,266 @@
+openapi: 3.1.0
+info:
+  title: S1 Bookmark Manager API
+  version: "0.1.0"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+        name:
+          type: string
+    UserResponse:
+      type: object
+      required: [id, email, name]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        name:
+          type: string
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+    TokenResponse:
+      type: object
+      required: [access_token, token_type]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+    BookmarkCreate:
+      type: object
+      required: [url, title]
+      properties:
+        url:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+    BookmarkUpdate:
+      type: object
+      properties:
+        url:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+    BookmarkResponse:
+      type: object
+      required: [id, url, title, tags]
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+    BookmarkPage:
+      type: object
+      required: [items, total, page, size]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookmarkResponse"
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+    TagCount:
+      type: object
+      required: [name, count]
+      properties:
+        name:
+          type: string
+        count:
+          type: integer
+    TagListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TagCount"
+paths:
+  /api/health:
+    get:
+      operationId: healthCheck
+      security: []
+      x-foundry-rules: Always returns HTTP 200 with status ok.
+      responses:
+        "200":
+          description: Service healthy
+  /api/auth/register:
+    post:
+      operationId: registerUser
+      security: []
+      x-foundry-rules: Creates user account and returns 201 with id, email, name.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+  /api/auth/login:
+    post:
+      operationId: loginUser
+      security: []
+      x-foundry-rules: Authenticates email/password and returns bearer access_token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+  /api/auth/me:
+    get:
+      operationId: getMe
+      security:
+        - bearerAuth: []
+      x-foundry-rules: Returns current authenticated user or 401 when bearer token is missing/invalid.
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+  /api/bookmarks:
+    post:
+      operationId: createBookmark
+      security:
+        - bearerAuth: []
+      x-foundry-rules: Validates http/https url and creates bookmark owned by current user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookmarkCreate"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookmarkResponse"
+    get:
+      operationId: listBookmarks
+      security:
+        - bearerAuth: []
+      x-foundry-rules: Lists bookmarks owned by current user with q, tag, page, and size filters.
+      responses:
+        "200":
+          description: Page of bookmarks
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookmarkPage"
+  /api/bookmarks/{bookmark_id}:
+    get:
+      operationId: getBookmark
+      security:
+        - bearerAuth: []
+      x-foundry-rules: Returns bookmark if owned by current user, else 404.
+      responses:
+        "200":
+          description: Bookmark detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookmarkResponse"
+    patch:
+      operationId: updateBookmark
+      security:
+        - bearerAuth: []
+      x-foundry-rules: Updates bookmark owned by current user, else 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookmarkUpdate"
+      responses:
+        "200":
+          description: Updated bookmark
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookmarkResponse"
+    delete:
+      operationId: deleteBookmark
+      security:
+        - bearerAuth: []
+      x-foundry-rules: Deletes bookmark owned by current user (204), else 404.
+      responses:
+        "204":
+          description: Deleted
+  /api/tags:
+    get:
+      operationId: listTags
+      security:
+        - bearerAuth: []
+      x-foundry-rules: "Returns sorted per-user tag counts {items: [{name, count}]}."
+      responses:
+        "200":
+          description: Tag counts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagListResponse"

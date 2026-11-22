@@ -1,0 +1,26 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-flash-lite",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "Gate G1 passed cleanly. Finishing build to run blocking Gate G2.",
+  "tool_calls": [
+    {
+      "id": "call_s1_11",
+      "name": "finish_build",
+      "args": {
+        "summary": "Implemented S1 Bookmark Manager backend (auth, bookmarks, tags) and frontend selectors."
+      }
+    }
+  ],
+  "tokens_in": 1700,
+  "tokens_cached": 1100,
+  "tokens_out": 45,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "s1-bookmarks-step-2",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}

@@ -1,0 +1,9 @@
+required_testids:
+  - auth-email-input
+  - auth-password-input
+  - auth-submit-btn
+  - bookmark-form
+  - bookmark-url-input
+  - bookmark-title-input
+  - bookmark-list
+  - bookmark-search-input

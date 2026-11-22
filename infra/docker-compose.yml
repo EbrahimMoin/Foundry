@@ -52,12 +52,16 @@ volumes:
 
 networks:
   foundry_control:
+    name: foundry_control
     driver: bridge
   foundry_sandbox_db:
+    name: foundry_sandbox_db
     driver: bridge
     internal: true
   foundry_sandbox_egress:
+    name: foundry_sandbox_egress
     driver: bridge
     internal: true
   foundry_proxy_wan:
+    name: foundry_proxy_wan
     driver: bridge

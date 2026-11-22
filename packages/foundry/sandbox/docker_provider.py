@@ -78,6 +78,13 @@ class LocalDockerProvider:
 
         limits = self._runtime_cfg.sandbox_limits
         merged_env = {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": "/workspace/backend",
+            "MYPYPATH": "/workspace/backend",
+            "RUFF_CACHE_DIR": "/tmp/.ruff_cache",  # noqa: S108
+            "MYPY_CACHE_DIR": "/tmp/.mypy_cache",  # noqa: S108
+            "PYTHONPYCACHEPREFIX": "/tmp/__pycache__",  # noqa: S108
+            "XDG_CACHE_HOME": "/tmp/.cache",  # noqa: S108
             **env,
             "NODE_OPTIONS": f"--max-old-space-size={limits.node_max_old_space_mb}",
         }

@@ -88,20 +88,44 @@ class LogicalDBManager:
     async def _release_template_lock(self, conn: Any) -> None:
         await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", _LOCK_KEY_LITERAL)
 
-    async def startup_cleanup(self) -> None:
-        """Terminate stale template sessions and re-lock app_template after a crash."""
+    async def _ensure_template_db_locked(self, conn: Any) -> bool:
+        """Create app_template locked if missing; return True if newly created."""
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            self._template_db,
+        )
+        if exists:
+            return False
+        await conn.execute(f"CREATE DATABASE {self._template_db} WITH ALLOW_CONNECTIONS false")
+        await conn.execute(f"REVOKE CONNECT ON DATABASE {self._template_db} FROM PUBLIC")
+        return True
+
+    async def ensure_template_db(self) -> None:
+        """Ensure `app_template` exists and is locked when not being refreshed."""
         conn = await self._connect_fn(self._admin_dsn)
         try:
             await self._acquire_template_lock(conn)
             try:
-                exists = await conn.fetchval(
-                    "SELECT 1 FROM pg_database WHERE datname = $1",
-                    self._template_db,
-                )
-                if exists:
+                await self._ensure_template_db_locked(conn)
+            finally:
+                await self._release_template_lock(conn)
+        finally:
+            await conn.close()
+
+    async def startup_cleanup(self) -> None:
+        """Terminate stale template sessions and ensure app_template exists and is locked."""
+        conn = await self._connect_fn(self._admin_dsn)
+        try:
+            await self._acquire_template_lock(conn)
+            try:
+                created = await self._ensure_template_db_locked(conn)
+                if not created:
                     await self._terminate_connections(conn, self._template_db)
                     await conn.execute(
                         f"ALTER DATABASE {self._template_db} WITH ALLOW_CONNECTIONS false"
+                    )
+                    await conn.execute(
+                        f"REVOKE CONNECT ON DATABASE {self._template_db} FROM PUBLIC"
                     )
             finally:
                 await self._release_template_lock(conn)

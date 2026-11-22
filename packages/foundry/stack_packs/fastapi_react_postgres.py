@@ -187,7 +187,19 @@ class FastAPIReactPostgresPack:
             '  "pyjwt>=2.9",\n'
             '  "sqlalchemy[asyncio]>=2.0",\n'
             '  "uvicorn[standard]>=0.30",\n'
-            "]\n"
+            "]\n\n"
+            "[tool.pytest.ini_options]\n"
+            'pythonpath = ["."]\n'
+            'asyncio_mode = "auto"\n\n'
+            "[tool.ruff]\n"
+            'target-version = "py312"\n'
+            "line-length = 100\n"
+            'src = ["."]\n\n'
+            "[tool.ruff.lint]\n"
+            'select = ["E", "F", "W", "I", "B"]\n\n'
+            "[tool.mypy]\n"
+            'python_version = "3.12"\n'
+            "ignore_missing_imports = true\n"
         )
 
     @staticmethod
@@ -199,7 +211,6 @@ from __future__ import annotations
 import importlib
 import pkgutil
 
-import app.features
 from fastapi import FastAPI
 
 app = FastAPI(title={app_name!r})
@@ -211,7 +222,8 @@ async def health() -> dict[str, str]:
 
 
 def _register_feature_routers(application: FastAPI) -> None:
-    for mod_info in pkgutil.iter_modules(app.features.__path__, "app.features."):
+    features_pkg = importlib.import_module("app.features")
+    for mod_info in pkgutil.iter_modules(features_pkg.__path__, "app.features."):
         router_mod_name = f"{{mod_info.name}}.router"
         try:
             mod = importlib.import_module(router_mod_name)
@@ -356,17 +368,22 @@ async def get_db() -> AsyncIterator[AsyncSession]:
         yield session
 """
 
-_CORE_SECURITY_PY = """from fastapi import Depends, HTTPException, status
+_CORE_SECURITY_PY = """from typing import Annotated
+
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
-    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
 ) -> dict[str, str]:
     if creds is None or not creds.credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
     return {"id": creds.credentials, "role": "member"}
 """
 
@@ -416,6 +433,7 @@ from typing import Any
 
 import httpx
 import pytest
+
 from app.main import app
 
 
