@@ -1,0 +1,18 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-flash",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "{\"version\": 1, \"tables\": {\"users\": {\"columns\": [{\"name\": \"id\", \"type\": \"text\", \"primary_key\": true}, {\"name\": \"email\", \"type\": \"text\", \"unique\": true}, {\"name\": \"password_hash\", \"type\": \"text\"}, {\"name\": \"name\", \"type\": \"text\"}], \"indexes\": [\"idx_users_email\"]}, \"bookmarks\": {\"columns\": [{\"name\": \"id\", \"type\": \"text\", \"primary_key\": true}, {\"name\": \"user_id\", \"type\": \"text\", \"references\": \"users.id\"}, {\"name\": \"url\", \"type\": \"text\"}, {\"name\": \"title\", \"type\": \"text\"}, {\"name\": \"description\", \"type\": \"text\", \"nullable\": true}], \"indexes\": [\"idx_bookmarks_user_id\"]}, \"tags\": {\"columns\": [{\"name\": \"id\", \"type\": \"text\", \"primary_key\": true}, {\"name\": \"name\", \"type\": \"text\", \"unique\": true}], \"indexes\": [\"idx_tags_name\"]}, \"bookmark_tags\": {\"columns\": [{\"name\": \"bookmark_id\", \"type\": \"text\", \"references\": \"bookmarks.id\"}, {\"name\": \"tag_id\", \"type\": \"text\", \"references\": \"tags.id\"}], \"indexes\": [\"idx_bt_pk\"]}}}",
+  "tool_calls": [],
+  "tokens_in": 600,
+  "tokens_cached": 300,
+  "tokens_out": 200,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "s1-m2-data-0",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}

@@ -11,10 +11,21 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
 from foundry.agents.single import ReplayMockSandboxProvider, SingleAgentRunner
+from foundry.blackboard import (
+    BlackboardDB,
+    BlackboardRepository,
+    EventDispatcher,
+    EventRelay,
+    JsonFileBlackboardRepository,
+    PostgresBlackboardRepository,
+    resolve_dsn,
+    run_migrations,
+)
 from foundry.config.loader import (
     CONFIG_DIR_DEFAULT,
     ConfigError,
@@ -27,13 +38,20 @@ from foundry.config.loader import (
     save_models_config,
     save_project_config,
 )
-from foundry.config.schemas import BudgetConfig, ModelsConfig
+from foundry.config.schemas import AutonomyConfig, AutonomyPreset, BudgetConfig, ModelsConfig
+from foundry.decisions import DecisionService
 from foundry.gateway.cassette import CassetteStore, MissPolicy
 from foundry.gateway.protocol import GatewayRequest, GatewayResponse
 from foundry.gateway.router import ModelGateway
 from foundry.sandbox import HeavyExecSemaphore, LocalDockerProvider, SandboxProvider
 from foundry.security.vault import CredentialVault, VaultError
 from foundry.stack_packs import get_stack_pack
+from foundry.supervisor import (
+    JsonFileCheckpointSaver,
+    RunStateSummary,
+    RunSupervisor,
+    create_postgres_saver_context,
+)
 
 app = typer.Typer(
     name="foundry",
@@ -44,10 +62,16 @@ models_app = typer.Typer(help="Inspect, configure, and test first-party SDK mode
 stack_app = typer.Typer(help="Inspect and scaffold stack-pack Wave 0 skeletons.")
 sandbox_app = typer.Typer(help="Check sandbox runtime, Docker Engine, and workspace guards.")
 bench_app = typer.Typer(help="Run foundry-bench baselines and evaluation suites.")
+db_app = typer.Typer(help="Manage Postgres Blackboard schema and migrations.")
+decisions_app = typer.Typer(help="CLI Decision Inbox: inspect and resolve pending decisions.")
+run_app = typer.Typer(help="Orchestrate multi-thread contract-first Foundry runs.")
 app.add_typer(models_app, name="models")
 app.add_typer(stack_app, name="stack")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(bench_app, name="bench")
+app.add_typer(db_app, name="db")
+app.add_typer(decisions_app, name="decisions")
+app.add_typer(run_app, name="run")
 
 console = Console()
 
@@ -636,3 +660,413 @@ def bench_run_b1(
         console.print(f"[red]Error:[/red]\n{result.error}")
     if result.status != "passed":
         raise typer.Exit(code=1)
+
+
+def _open_blackboard(
+    dsn: str | None,
+    state_file: Path | None,
+) -> tuple[BlackboardRepository, BlackboardDB | None]:
+    if state_file is not None:
+        return JsonFileBlackboardRepository(state_file), None
+    db = BlackboardDB(resolve_dsn(dsn))
+    return PostgresBlackboardRepository(db), db
+
+
+@db_app.command("migrate")
+def db_migrate(
+    dsn: Annotated[
+        str | None, typer.Option(help="Postgres DSN (defaults to FOUNDRY_DATABASE_URL)")
+    ] = None,
+) -> None:
+    """Apply Postgres Blackboard & pgvector Alembic migrations to head."""
+    resolved = resolve_dsn(dsn)
+    try:
+        asyncio.run(run_migrations(resolved))
+    except Exception as exc:
+        console.print(f"[red]Blackboard migration failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("[green]Blackboard Postgres schema migrated to head.[/green]")
+
+
+@decisions_app.command("list")
+def decisions_list(
+    run_id: Annotated[str | None, typer.Option(help="Filter by run ID")] = None,
+    all_decisions: Annotated[
+        bool,
+        typer.Option("--all", help="Include auto_decided and resolved decisions"),
+    ] = False,
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+) -> None:
+    """List pending (or all) human/agent decisions from the Blackboard."""
+
+    async def _run() -> list[Any]:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            status_filter = None if all_decisions else "pending"
+            return await repo.list_decisions(run_id=run_id, status=status_filter)
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    rows = asyncio.run(_run())
+    table = Table(title="Foundry Decision Inbox")
+    table.add_column("Decision ID", style="cyan", no_wrap=True, overflow="fold")
+    table.add_column("Run ID", no_wrap=True, overflow="fold")
+    table.add_column("Category")
+    table.add_column("Mode")
+    table.add_column("Status")
+    table.add_column("Title")
+    for row in rows:
+        table.add_row(row.id, row.run_id, row.category, row.mode, row.status, row.title)
+    console.print(table)
+
+
+@decisions_app.command("show")
+def decisions_show(
+    decision_id: Annotated[str, typer.Argument(help="Decision ID to inspect")],
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+) -> None:
+    """Show full context, options, and impact of a Blackboard decision."""
+
+    async def _run() -> Any:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            return await repo.get_decision(decision_id)
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    try:
+        dec = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[bold cyan]{dec.id}[/bold cyan] — {dec.title}")
+    console.print(
+        f"Run: {dec.run_id} | Category: {dec.category} | Mode: {dec.mode} | Status: {dec.status}"
+    )
+    console.print(
+        f"Reversibility: {dec.reversibility} | Confidence: {dec.confidence} | "
+        f"Recommendation: {dec.recommendation}"
+    )
+    console.print(f"Options: {dec.options}")
+    console.print(f"Context: {dec.context}")
+    if dec.answer is not None:
+        console.print(f"Answer: {dec.answer} (by {dec.decided_by})")
+
+
+@decisions_app.command("resolve")
+def decisions_resolve(
+    decision_id: Annotated[str, typer.Argument(help="Decision ID to resolve")],
+    approve: Annotated[
+        bool,
+        typer.Option("--approve/--reject", help="Approve or reject the decision"),
+    ] = True,
+    choice: Annotated[str | None, typer.Option(help="Chosen option string")] = None,
+    feedback: Annotated[str | None, typer.Option(help="Feedback or rejection reason")] = None,
+    by: Annotated[str, typer.Option(help="Reviewer identifier")] = "human",
+    adr_dir: Annotated[Path | None, typer.Option(help="Directory to record ADR markdown")] = None,
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+) -> None:
+    """Approve or reject a pending decision and emit `decision.resolved`."""
+
+    async def _run() -> Any:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            svc = DecisionService(repo, adr_dir=adr_dir)
+            updated = await svc.resolve(
+                decision_id,
+                action="approve" if approve else "reject",
+                choice=choice,
+                feedback=feedback,
+                decided_by=by,
+            )
+            relay = EventRelay(repo, EventDispatcher(repo))
+            await relay.flush_once()
+            return updated
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    try:
+        updated = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[red]Failed to resolve decision:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Resolved[/green] {updated.id} -> action={'approve' if approve else 'reject'} "
+        f"(status={updated.status}, version={updated.version})"
+    )
+
+
+def _load_spec_inputs(
+    spec_arg: str,
+    spec_dir: Path | None,
+) -> tuple[str, dict[str, Any] | None, str | None, list[str], str | None]:
+    spec_path = Path(spec_arg)
+    spec_text = spec_path.read_text(encoding="utf-8") if spec_path.is_file() else spec_arg
+    pinned_openapi_doc: dict[str, Any] | None = None
+    pinned_openapi_yaml: str | None = None
+    pinned_testids: list[str] = []
+    pinned_testids_yaml: str | None = None
+
+    if spec_dir is not None:
+        oa_path = spec_dir / "pinned_openapi.yaml"
+        if oa_path.is_file():
+            pinned_openapi_yaml = oa_path.read_text(encoding="utf-8")
+            loaded = yaml.safe_load(pinned_openapi_yaml)
+            if isinstance(loaded, dict):
+                pinned_openapi_doc = loaded
+        ti_path = spec_dir / "pinned_testids.yaml"
+        if ti_path.is_file():
+            pinned_testids_yaml = ti_path.read_text(encoding="utf-8")
+            loaded_ti = yaml.safe_load(pinned_testids_yaml)
+            if isinstance(loaded_ti, dict) and isinstance(loaded_ti.get("required_testids"), list):
+                pinned_testids = [str(x) for x in loaded_ti["required_testids"]]
+            elif isinstance(loaded_ti, list):
+                pinned_testids = [str(x) for x in loaded_ti]
+
+    return spec_text, pinned_openapi_doc, pinned_openapi_yaml, pinned_testids, pinned_testids_yaml
+
+
+def _render_run_summary(summary: RunStateSummary) -> None:
+    table = Table(title=f"Foundry Run ({summary.run_id})")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+    table.add_row("Run ID", summary.run_id)
+    table.add_row("Status", summary.status)
+    table.add_row("Phase", summary.phase)
+    locked = sum(1 for c in summary.contracts if c.status == "locked")
+    table.add_row("Contracts Locked", f"{locked}/{len(summary.contracts)}")
+    merged = sum(1 for t in summary.tasks if t.status == "MERGED")
+    table.add_row("Tasks Merged", f"{merged}/{len(summary.tasks)}")
+    table.add_row("Pending Decisions", str(len(summary.pending_decisions)))
+    console.print(table)
+    for dec in summary.pending_decisions:
+        console.print(f"[yellow]Pending Decision:[/yellow] {dec.id} — {dec.title}")
+
+
+@run_app.command("start")
+def run_start(
+    spec: Annotated[str, typer.Argument(help="App specification text or path to spec .md")],
+    name: Annotated[str, typer.Option(help="Application / task slug")] = "app",
+    spec_dir: Annotated[
+        Path | None,
+        typer.Option(help="Optional directory with pinned_openapi.yaml & pinned_testids.yaml"),
+    ] = None,
+    autonomy: Annotated[
+        AutonomyPreset,
+        typer.Option(
+            help="Autonomy preset (balanced, autopilot, architect, full_control, benchmark)"
+        ),
+    ] = AutonomyPreset.BALANCED,
+    config_dir: Annotated[Path, typer.Option()] = CONFIG_DIR_DEFAULT,
+    replay: Annotated[
+        bool,
+        typer.Option("--replay", help="Replay Orchestrator & Lead turns from $0 cassettes"),
+    ] = False,
+    cassette_dir: Annotated[Path, typer.Option()] = Path("tests/cassettes"),
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+    adr_dir: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Start a contract-first multi-thread Foundry run backed by Blackboard & Checkpointer."""
+    models_cfg = _load_or_default_models(config_dir)
+    spec_text, pinned_oa, pinned_oa_yaml, pinned_ti, pinned_ti_yaml = _load_spec_inputs(
+        spec, spec_dir
+    )
+    cassettes = CassetteStore(cassette_dir, miss_policy=MissPolicy.STRICT) if replay else None
+    autonomy_cfg = AutonomyConfig(preset=autonomy)
+
+    async def _run() -> RunStateSummary:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            if state_file is not None:
+                ckpt = JsonFileCheckpointSaver(Path(f"{state_file}.ckpt.json"))
+                supervisor = RunSupervisor(
+                    repo,
+                    models_cfg=models_cfg,
+                    autonomy_cfg=autonomy_cfg,
+                    cassettes=cassettes,
+                    checkpointer=ckpt,
+                    adr_dir=adr_dir,
+                )
+                return await supervisor.start_run(
+                    spec=spec_text,
+                    app_name=name,
+                    task_slug=name,
+                    pinned_openapi=pinned_oa,
+                    pinned_openapi_yaml=pinned_oa_yaml,
+                    pinned_testids=pinned_ti,
+                    pinned_testids_yaml=pinned_ti_yaml,
+                )
+
+            async with create_postgres_saver_context(resolve_dsn(dsn)) as saver:
+                await saver.setup()
+                supervisor = RunSupervisor(
+                    repo,
+                    models_cfg=models_cfg,
+                    autonomy_cfg=autonomy_cfg,
+                    cassettes=cassettes,
+                    checkpointer=saver,
+                    adr_dir=adr_dir,
+                )
+                return await supervisor.start_run(
+                    spec=spec_text,
+                    app_name=name,
+                    task_slug=name,
+                    pinned_openapi=pinned_oa,
+                    pinned_openapi_yaml=pinned_oa_yaml,
+                    pinned_testids=pinned_ti,
+                    pinned_testids_yaml=pinned_ti_yaml,
+                )
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    summary = asyncio.run(_run())
+    _render_run_summary(summary)
+
+
+@run_app.command("status")
+def run_status(
+    run_id: Annotated[str, typer.Argument(help="Run ID to inspect")],
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+) -> None:
+    """Display run phase, locked contracts, tasks across Wave 1/2, and pending decisions."""
+
+    async def _run() -> RunStateSummary:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            run_rec = await repo.get_run(run_id)
+            contracts = await repo.list_contracts(run_id)
+            tasks = await repo.list_tasks(run_id)
+            pending = await repo.list_decisions(run_id=run_id, status="pending")
+            status = (
+                "waiting_decision"
+                if pending
+                else ("completed" if run_rec.phase == "done" else "paused_wave")
+            )
+            return RunStateSummary(
+                run_id=run_rec.id,
+                status=status,
+                phase=run_rec.phase,
+                contracts=contracts,
+                tasks=tasks,
+                pending_decisions=pending,
+            )
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    summary = asyncio.run(_run())
+    _render_run_summary(summary)
+
+    if summary.tasks:
+        task_tbl = Table(title="Tasks")
+        task_tbl.add_column("ID", style="cyan", no_wrap=True, overflow="fold")
+        task_tbl.add_column("Wave")
+        task_tbl.add_column("Domain")
+        task_tbl.add_column("Feature")
+        task_tbl.add_column("Kind")
+        task_tbl.add_column("Status")
+        for t in summary.tasks:
+            task_tbl.add_row(t.id, str(t.wave), t.domain, t.feature or "-", t.kind, t.status.value)
+        console.print(task_tbl)
+
+
+@run_app.command("resume")
+def run_resume(
+    run_id: Annotated[str, typer.Argument(help="Run ID to resume")],
+    spec_dir: Annotated[
+        Path | None,
+        typer.Option(help="Optional directory with pinned_openapi.yaml & pinned_testids.yaml"),
+    ] = None,
+    autonomy: Annotated[
+        AutonomyPreset,
+        typer.Option(help="Autonomy preset matching the run"),
+    ] = AutonomyPreset.BALANCED,
+    config_dir: Annotated[Path, typer.Option()] = CONFIG_DIR_DEFAULT,
+    replay: Annotated[
+        bool,
+        typer.Option("--replay", help="Replay Orchestrator & Lead turns from $0 cassettes"),
+    ] = False,
+    cassette_dir: Annotated[Path, typer.Option()] = Path("tests/cassettes"),
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+    adr_dir: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Resume a paused Foundry run from its checkpointed LangGraph thread."""
+    models_cfg = _load_or_default_models(config_dir)
+    _, pinned_oa, pinned_oa_yaml, pinned_ti, pinned_ti_yaml = _load_spec_inputs("", spec_dir)
+    cassettes = CassetteStore(cassette_dir, miss_policy=MissPolicy.STRICT) if replay else None
+    autonomy_cfg = AutonomyConfig(preset=autonomy)
+
+    async def _run() -> RunStateSummary:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            if state_file is not None:
+                ckpt = JsonFileCheckpointSaver(Path(f"{state_file}.ckpt.json"))
+                supervisor = RunSupervisor(
+                    repo,
+                    models_cfg=models_cfg,
+                    autonomy_cfg=autonomy_cfg,
+                    cassettes=cassettes,
+                    checkpointer=ckpt,
+                    adr_dir=adr_dir,
+                )
+                return await supervisor.resume_run(
+                    run_id,
+                    pinned_openapi=pinned_oa,
+                    pinned_openapi_yaml=pinned_oa_yaml,
+                    pinned_testids=pinned_ti,
+                    pinned_testids_yaml=pinned_ti_yaml,
+                )
+
+            async with create_postgres_saver_context(resolve_dsn(dsn)) as saver:
+                await saver.setup()
+                supervisor = RunSupervisor(
+                    repo,
+                    models_cfg=models_cfg,
+                    autonomy_cfg=autonomy_cfg,
+                    cassettes=cassettes,
+                    checkpointer=saver,
+                    adr_dir=adr_dir,
+                )
+                return await supervisor.resume_run(
+                    run_id,
+                    pinned_openapi=pinned_oa,
+                    pinned_openapi_yaml=pinned_oa_yaml,
+                    pinned_testids=pinned_ti,
+                    pinned_testids_yaml=pinned_ti_yaml,
+                )
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    summary = asyncio.run(_run())
+    _render_run_summary(summary)

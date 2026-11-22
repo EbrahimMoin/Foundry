@@ -1,0 +1,18 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-flash",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "{\"version\": 1, \"routes\": [{\"path\": \"/login\", \"component\": \"LoginForm\", \"label\": \"Login\", \"nav\": true, \"test_id\": \"nav-login\"}, {\"path\": \"/bookmarks\", \"component\": \"BookmarkPage\", \"label\": \"Bookmarks\", \"nav\": true, \"test_id\": \"nav-bookmarks\"}], \"components\": {\"LoginForm\": {\"export_path\": \"frontend/src/features/auth/LoginForm.tsx\", \"props\": {}, \"emits\": [\"onLogin\"], \"testids\": [\"auth-email-input\", \"auth-password-input\", \"auth-submit-btn\"]}, \"BookmarkPage\": {\"export_path\": \"frontend/src/features/bookmarks/BookmarkPage.tsx\", \"props\": {}, \"emits\": [\"onCreate\", \"onSearch\"], \"testids\": [\"bookmark-form\", \"bookmark-url-input\", \"bookmark-title-input\", \"bookmark-list\", \"bookmark-search-input\"]}}}",
+  "tool_calls": [],
+  "tokens_in": 700,
+  "tokens_cached": 350,
+  "tokens_out": 150,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "s1-m2-fe-0",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}

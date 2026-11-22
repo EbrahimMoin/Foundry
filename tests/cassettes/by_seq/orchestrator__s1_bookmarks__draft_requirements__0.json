@@ -1,0 +1,18 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-pro",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "{\"summary\": \"Multi-user Bookmark Manager with auth, URL CRUD, search/tag filtering, and tag counts.\", \"features\": [{\"name\": \"auth\", \"description\": \"Registration, login, bearer auth\"}, {\"name\": \"bookmarks\", \"description\": \"Bookmark CRUD, URL validation, search\"}, {\"name\": \"tags\", \"description\": \"Alphabetical per-user tag counters\"}], \"roles\": [\"member\"], \"non_functional\": [\"Per-user data isolation\", \"OpenAPI 3.1 contract conformance\"]}",
+  "tool_calls": [],
+  "tokens_in": 400,
+  "tokens_cached": 200,
+  "tokens_out": 120,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "s1-m2-req-0",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}

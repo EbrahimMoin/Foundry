@@ -153,3 +153,53 @@ def test_cli_build_and_bench_b1_replay_offline(tmp_path: Path) -> None:
     )
     assert bench_res.exit_code == 0, bench_res.stdout
     assert (bench_dir / "result.json").is_file()
+
+
+def test_cli_run_start_status_and_resume_offline(tmp_path: Path) -> None:
+    import re
+
+    cfg_dir = tmp_path / "cfg_run"
+    proj_dir = tmp_path / "proj_run"
+    state_file = tmp_path / "bb_state.json"
+    assert (
+        runner.invoke(
+            app,
+            ["init", "--config-dir", str(cfg_dir), "--project-dir", str(proj_dir), "--name", "s1"],
+        ).exit_code
+        == 0
+    )
+
+    start_res = runner.invoke(
+        app,
+        [
+            "run",
+            "start",
+            "bench/specs/s1_bookmarks/spec.md",
+            "--name",
+            "s1_bookmarks",
+            "--spec-dir",
+            "bench/specs/s1_bookmarks",
+            "--autonomy",
+            "autopilot",
+            "--config-dir",
+            str(cfg_dir),
+            "--replay",
+            "--cassette-dir",
+            "tests/cassettes",
+            "--state-file",
+            str(state_file),
+        ],
+    )
+    assert start_res.exit_code == 0, start_res.stdout
+    assert "completed" in start_res.stdout
+    match = re.search(r"(run_[0-9a-z]+)", start_res.stdout)
+    assert match is not None
+    run_id = match.group(1)
+
+    status_res = runner.invoke(
+        app,
+        ["run", "status", run_id, "--state-file", str(state_file)],
+    )
+    assert status_res.exit_code == 0, status_res.stdout
+    assert "4/4" in status_res.stdout
+    assert "MERGED" in status_res.stdout

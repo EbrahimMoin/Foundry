@@ -1,0 +1,18 @@
+{
+  "provider_id": "gemini_paid",
+  "model": "gemini-2.5-flash",
+  "transport": "google_genai",
+  "billing_mode": "paid_api",
+  "content": "{\"python_packages\": [\"fastapi\", \"sqlalchemy\", \"alembic\", \"pydantic-settings\", \"pyjwt\"], \"npm_packages\": [\"react\", \"lucide-react\"], \"ci_workflow\": \".github/workflows/ci.yml\", \"deploy_target\": \"local_compose\"}",
+  "tool_calls": [],
+  "tokens_in": 500,
+  "tokens_cached": 250,
+  "tokens_out": 80,
+  "latency_ms": 1,
+  "cost_usd": 0.0,
+  "est_value_usd": 0.0,
+  "prompt_hash": "s1-m2-infra-0",
+  "replayed": true,
+  "family": "gemini",
+  "ratelimit_backoff_ms": 0
+}
