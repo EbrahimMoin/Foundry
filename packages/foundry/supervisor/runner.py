@@ -82,6 +82,7 @@ class RunSupervisor:
         adr_dir: Path | None = None,
         task_executor: TaskExecutor | None = None,
         auto_execute_waves: bool = True,
+        parallel_scheduler: Any | None = None,
     ) -> None:
         self.repo = repo
         self.models_cfg = models_cfg or default_models_config()
@@ -104,6 +105,7 @@ class RunSupervisor:
         self.relay = EventRelay(repo, self.dispatcher)
         self.task_executor = task_executor or _default_task_executor
         self.auto_execute_waves = auto_execute_waves
+        self.parallel_scheduler = parallel_scheduler
 
         self._run_meta: dict[str, dict[str, Any]] = {}
         self._wave1_key_maps: dict[str, dict[str, str]] = {}
@@ -154,6 +156,11 @@ class RunSupervisor:
         for ctr in await self.repo.list_contracts(run_id):
             ver = await self.repo.get_latest_contract_version(ctr.id)
             contract_map[ctr.name] = ver.body
+
+        if self.parallel_scheduler is not None:
+            await self.parallel_scheduler.run_wave(run_id, wave=wave, contracts=contract_map)
+            wave_tasks = await self.repo.list_tasks(run_id, wave=wave)
+            return bool(wave_tasks) and all(t.status == TaskStatus.MERGED for t in wave_tasks)
 
         while True:
             await advance_ready_tasks(self.repo, run_id)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -23,11 +23,15 @@ from foundry.blackboard.models import (
     ContractChangeRequestRow,
     ContractRecord,
     ContractRow,
+    ContractSubscriptionRecord,
+    ContractSubscriptionRow,
     ContractVersionRecord,
     ContractVersionRow,
     DecisionRecord,
     DecisionRow,
     EventRow,
+    FeatureRecord,
+    FeatureRow,
     LlmCallRecord,
     LlmCallRow,
     MessageRecord,
@@ -35,6 +39,7 @@ from foundry.blackboard.models import (
     NoteRecord,
     NoteRow,
     ProcessedEventRow,
+    ReservationConflict,
     RunRecord,
     RunRow,
     TaskDependencyRow,
@@ -43,7 +48,10 @@ from foundry.blackboard.models import (
     TaskStatus,
     TaskWriteSetRow,
     ThreadRow,
+    WriteReservationRecord,
+    WriteReservationRow,
 )
+from foundry.security.workspace_guard import normalize_repo_path, paths_overlap
 
 
 class StaleWriteError(Exception):
@@ -202,6 +210,30 @@ def _to_event_dto(row: EventRow) -> BlackboardEvent:
     )
 
 
+def _to_reservation_dto(row: WriteReservationRow) -> WriteReservationRecord:
+    return WriteReservationRecord(
+        id=int(row.id),
+        run_id=row.run_id,
+        task_id=row.task_id,
+        path=row.path,
+        expires_at=row.expires_at,
+        heartbeat_at=row.heartbeat_at,
+        released_at=row.released_at,
+    )
+
+
+def _to_feature_dto(row: FeatureRow) -> FeatureRecord:
+    return FeatureRecord(
+        run_id=row.run_id,
+        name=row.name,
+        status=row.status,
+        budget_blackbox_tests_usd=float(row.budget_blackbox_tests_usd),
+        spent_blackbox_tests_usd=float(row.spent_blackbox_tests_usd),
+        dispute_rounds=int(row.dispute_rounds),
+        updated_at=row.updated_at,
+    )
+
+
 @runtime_checkable
 class BlackboardRepository(Protocol):
     """Typed storage + transactional outbox contract for Foundry Blackboard state."""
@@ -260,6 +292,7 @@ class BlackboardRepository(Protocol):
         task_id: str | None = None,
         base_sha: str | None = None,
         graph_thread_id: str | None = None,
+        parent_task_id: str | None = None,
     ) -> TaskRecord: ...
 
     async def get_task(self, task_id: str) -> TaskRecord: ...
@@ -289,6 +322,62 @@ class BlackboardRepository(Protocol):
         graph_thread_id: str | None = None,
         event_payload: dict[str, Any] | None = None,
     ) -> TaskRecord: ...
+
+    async def increment_task_contract_reopens(
+        self, task_id: str, expected_version: int
+    ) -> TaskRecord: ...
+
+    async def update_task_pending_deps(
+        self,
+        task_id: str,
+        pending_deps: Sequence[dict[str, Any]],
+        expected_version: int,
+    ) -> TaskRecord: ...
+
+    async def update_task_metadata(
+        self,
+        task_id: str,
+        expected_version: int,
+        *,
+        base_sha: str | None = None,
+        branch: str | None = None,
+        worktree_path: str | None = None,
+        attempt: int | None = None,
+        graph_thread_id: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> TaskRecord: ...
+
+    async def acquire_write_reservations(
+        self,
+        run_id: str,
+        task_id: str,
+        paths: Sequence[str],
+        *,
+        ttl_seconds: int = 600,
+    ) -> tuple[list[WriteReservationRecord], list[ReservationConflict]]: ...
+
+    async def renew_write_reservations(
+        self,
+        run_id: str,
+        *,
+        task_ids: Sequence[str] | None = None,
+        ttl_seconds: int = 600,
+    ) -> int: ...
+
+    async def release_write_reservations(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        reason: str = "released",
+    ) -> int: ...
+
+    async def list_active_reservations(
+        self,
+        run_id: str,
+        *,
+        include_expired: bool = False,
+    ) -> list[WriteReservationRecord]: ...
 
     async def save_contract_version(
         self,
@@ -336,6 +425,43 @@ class BlackboardRepository(Protocol):
     async def list_contract_change_requests(
         self, contract_id: str
     ) -> list[ContractChangeRequestRecord]: ...
+
+    async def subscribe_task_to_contract(
+        self,
+        contract_id: str,
+        task_id: str,
+        scope: Sequence[str] = (),
+    ) -> ContractSubscriptionRecord: ...
+
+    async def list_contract_subscriptions(
+        self, contract_id: str
+    ) -> list[ContractSubscriptionRecord]: ...
+
+    async def update_contract_change_request(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        batch_id: str | None = None,
+        classified_as: str | None = None,
+    ) -> ContractChangeRequestRecord: ...
+
+    async def increment_contract_breaking_in_wave(
+        self, contract_id: str, expected_version: int
+    ) -> ContractRecord: ...
+
+    async def upsert_feature(
+        self,
+        run_id: str,
+        name: str,
+        *,
+        status: str = "pending",
+        budget_blackbox_tests_usd: float = 0.30,
+        spent_delta_usd: float = 0.0,
+        dispute_rounds_delta: int = 0,
+    ) -> FeatureRecord: ...
+
+    async def list_features(self, run_id: str) -> list[FeatureRecord]: ...
 
     async def get_or_create_decision(
         self,
@@ -586,6 +712,7 @@ class PostgresBlackboardRepository:
         task_id: str | None = None,
         base_sha: str | None = None,
         graph_thread_id: str | None = None,
+        parent_task_id: str | None = None,
     ) -> TaskRecord:
         tid = task_id or _new_id("t")
         async with self._db.session_factory() as s, s.begin():
@@ -600,6 +727,7 @@ class PostgresBlackboardRepository:
                 description=description,
                 acceptance=list(acceptance),
                 status=status,
+                parent_task_id=parent_task_id,
                 base_sha=base_sha,
                 graph_thread_id=graph_thread_id,
                 budget_implement_usd=budget_implement_usd,
@@ -729,6 +857,275 @@ class PostgresBlackboardRepository:
             refreshed = await s.get(TaskRow, task_id)
             assert refreshed is not None
             return _to_task_dto(refreshed)
+
+    async def increment_task_contract_reopens(
+        self, task_id: str, expected_version: int
+    ) -> TaskRecord:
+        async with self._db.session_factory() as s, s.begin():
+            existing = await s.get(TaskRow, task_id)
+            if existing is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            res = await s.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id, TaskRow.version == expected_version)
+                .values(
+                    contract_reopens=TaskRow.contract_reopens + 1,
+                    version=TaskRow.version + 1,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if _rowcount(res) == 0:
+                raise StaleWriteError(f"Stale write incrementing reopens on task {task_id}")
+            s.expire(existing)
+            refreshed = await s.get(TaskRow, task_id)
+            assert refreshed is not None
+            return _to_task_dto(refreshed)
+
+    async def update_task_pending_deps(
+        self,
+        task_id: str,
+        pending_deps: Sequence[dict[str, Any]],
+        expected_version: int,
+    ) -> TaskRecord:
+        async with self._db.session_factory() as s, s.begin():
+            existing = await s.get(TaskRow, task_id)
+            if existing is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            res = await s.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id, TaskRow.version == expected_version)
+                .values(
+                    pending_deps=[dict(item) for item in pending_deps],
+                    version=TaskRow.version + 1,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if _rowcount(res) == 0:
+                raise StaleWriteError(f"Stale write updating pending_deps on task {task_id}")
+            s.expire(existing)
+            refreshed = await s.get(TaskRow, task_id)
+            assert refreshed is not None
+            return _to_task_dto(refreshed)
+
+    async def update_task_metadata(
+        self,
+        task_id: str,
+        expected_version: int,
+        *,
+        base_sha: str | None = None,
+        branch: str | None = None,
+        worktree_path: str | None = None,
+        attempt: int | None = None,
+        graph_thread_id: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> TaskRecord:
+        async with self._db.session_factory() as s, s.begin():
+            existing = await s.get(TaskRow, task_id)
+            if existing is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            values: dict[str, Any] = {
+                "version": TaskRow.version + 1,
+                "updated_at": datetime.now(UTC),
+            }
+            if base_sha is not None:
+                values["base_sha"] = base_sha
+            if branch is not None:
+                values["branch"] = branch
+            if worktree_path is not None:
+                values["worktree_path"] = worktree_path
+            if attempt is not None:
+                values["attempt"] = attempt
+            if graph_thread_id is not None:
+                values["graph_thread_id"] = graph_thread_id
+            if parent_task_id is not None:
+                values["parent_task_id"] = parent_task_id
+            res = await s.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id, TaskRow.version == expected_version)
+                .values(**values)
+            )
+            if _rowcount(res) == 0:
+                raise StaleWriteError(f"Stale write updating metadata on task {task_id}")
+            s.expire(existing)
+            refreshed = await s.get(TaskRow, task_id)
+            assert refreshed is not None
+            return _to_task_dto(refreshed)
+
+    async def acquire_write_reservations(
+        self,
+        run_id: str,
+        task_id: str,
+        paths: Sequence[str],
+        *,
+        ttl_seconds: int = 600,
+    ) -> tuple[list[WriteReservationRecord], list[ReservationConflict]]:
+        norm_paths = list(
+            dict.fromkeys(normalize_repo_path(p, allow_directory_slash=True) for p in paths)
+        )
+        if not norm_paths:
+            return [], []
+        async with self._db.session_factory() as s, s.begin():
+            await s.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext('reserve:' || :run_id))"),
+                {"run_id": run_id},
+            )
+            conflict_res = await s.execute(
+                text(
+                    """
+                    SELECT r.task_id, r.path AS holder_path, p.path AS requested_path
+                    FROM write_reservations r
+                    JOIN unnest(CAST(:paths AS text[])) AS p(path)
+                      ON r.path = p.path
+                      OR rtrim(r.path, '/') = rtrim(p.path, '/')
+                      OR (right(r.path, 1) = '/' AND starts_with(p.path, r.path))
+                      OR (right(p.path, 1) = '/' AND starts_with(r.path, p.path))
+                    WHERE r.run_id = :run_id
+                      AND r.task_id <> :task_id
+                      AND r.released_at IS NULL
+                      AND r.expires_at > now()
+                    """
+                ),
+                {"run_id": run_id, "task_id": task_id, "paths": norm_paths},
+            )
+            conflict_rows = conflict_res.mappings().all()
+            if conflict_rows:
+                conflicts = [
+                    ReservationConflict(
+                        requested_path=str(r["requested_path"]),
+                        holder_task_id=str(r["task_id"]),
+                        holder_path=str(r["holder_path"]),
+                    )
+                    for r in conflict_rows
+                ]
+                s.add(
+                    EventRow(
+                        run_id=run_id,
+                        type="reservation.denied",
+                        subject_id=task_id,
+                        payload={
+                            "task_id": task_id,
+                            "conflicts": [c.model_dump(mode="json") for c in conflicts],
+                        },
+                    )
+                )
+                return [], conflicts
+
+            now = datetime.now(UTC)
+            expires = now + timedelta(seconds=ttl_seconds)
+            existing_rows = (
+                await s.scalars(
+                    select(WriteReservationRow).where(
+                        WriteReservationRow.run_id == run_id,
+                        WriteReservationRow.task_id == task_id,
+                        WriteReservationRow.released_at.is_(None),
+                    )
+                )
+            ).all()
+            existing_by_path = {row.path: row for row in existing_rows}
+            created_or_renewed: list[WriteReservationRow] = []
+            for path in norm_paths:
+                existing_row = existing_by_path.get(path)
+                if existing_row is not None:
+                    existing_row.expires_at = expires
+                    existing_row.heartbeat_at = now
+                    created_or_renewed.append(existing_row)
+                else:
+                    row = WriteReservationRow(
+                        run_id=run_id,
+                        task_id=task_id,
+                        path=path,
+                        expires_at=expires,
+                        heartbeat_at=now,
+                    )
+                    s.add(row)
+                    created_or_renewed.append(row)
+            s.add(
+                EventRow(
+                    run_id=run_id,
+                    type="reservation.granted",
+                    subject_id=task_id,
+                    payload={"task_id": task_id, "paths": norm_paths},
+                )
+            )
+            await s.flush()
+            for row in created_or_renewed:
+                await s.refresh(row)
+            return [_to_reservation_dto(r) for r in created_or_renewed], []
+
+    async def renew_write_reservations(
+        self,
+        run_id: str,
+        *,
+        task_ids: Sequence[str] | None = None,
+        ttl_seconds: int = 600,
+    ) -> int:
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=ttl_seconds)
+        async with self._db.session_factory() as s, s.begin():
+            stmt = (
+                update(WriteReservationRow)
+                .where(
+                    WriteReservationRow.run_id == run_id,
+                    WriteReservationRow.released_at.is_(None),
+                    WriteReservationRow.expires_at > now,
+                )
+                .values(expires_at=expires, heartbeat_at=now)
+            )
+            if task_ids is not None:
+                id_list = list(task_ids)
+                if not id_list:
+                    return 0
+                stmt = stmt.where(WriteReservationRow.task_id.in_(id_list))
+            res = await s.execute(stmt)
+            return _rowcount(res)
+
+    async def release_write_reservations(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        reason: str = "released",
+    ) -> int:
+        now = datetime.now(UTC)
+        async with self._db.session_factory() as s, s.begin():
+            res = await s.execute(
+                update(WriteReservationRow)
+                .where(
+                    WriteReservationRow.run_id == run_id,
+                    WriteReservationRow.task_id == task_id,
+                    WriteReservationRow.released_at.is_(None),
+                )
+                .values(released_at=now)
+            )
+            count = _rowcount(res)
+            if count > 0:
+                ev_type = "reservation.expired" if reason == "expired" else "reservation.released"
+                s.add(
+                    EventRow(
+                        run_id=run_id,
+                        type=ev_type,
+                        subject_id=task_id,
+                        payload={"task_id": task_id, "count": count, "reason": reason},
+                    )
+                )
+            return count
+
+    async def list_active_reservations(
+        self,
+        run_id: str,
+        *,
+        include_expired: bool = False,
+    ) -> list[WriteReservationRecord]:
+        async with self._db.session_factory() as s:
+            stmt = select(WriteReservationRow).where(
+                WriteReservationRow.run_id == run_id,
+                WriteReservationRow.released_at.is_(None),
+            )
+            if not include_expired:
+                stmt = stmt.where(WriteReservationRow.expires_at > datetime.now(UTC))
+            stmt = stmt.order_by(WriteReservationRow.id)
+            rows = (await s.scalars(stmt)).all()
+            return [_to_reservation_dto(r) for r in rows]
 
     async def save_contract_version(
         self,
@@ -920,6 +1317,138 @@ class PostgresBlackboardRepository:
                 )
             ).all()
             return [_to_ccr_dto(r) for r in rows]
+
+    async def subscribe_task_to_contract(
+        self,
+        contract_id: str,
+        task_id: str,
+        scope: Sequence[str] = (),
+    ) -> ContractSubscriptionRecord:
+        scope_list = [str(x) for x in scope]
+        async with self._db.session_factory() as s, s.begin():
+            stmt = (
+                pg_insert(ContractSubscriptionRow)
+                .values(contract_id=contract_id, task_id=task_id, scope=scope_list)
+                .on_conflict_do_update(
+                    index_elements=["contract_id", "task_id"],
+                    set_={"scope": scope_list},
+                )
+            )
+            await s.execute(stmt)
+            return ContractSubscriptionRecord(
+                contract_id=contract_id,
+                task_id=task_id,
+                scope=scope_list,
+            )
+
+    async def list_contract_subscriptions(
+        self, contract_id: str
+    ) -> list[ContractSubscriptionRecord]:
+        async with self._db.session_factory() as s:
+            rows = (
+                await s.scalars(
+                    select(ContractSubscriptionRow).where(
+                        ContractSubscriptionRow.contract_id == contract_id
+                    )
+                )
+            ).all()
+            return [
+                ContractSubscriptionRecord(
+                    contract_id=r.contract_id,
+                    task_id=r.task_id,
+                    scope=list(r.scope),
+                )
+                for r in rows
+            ]
+
+    async def update_contract_change_request(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        batch_id: str | None = None,
+        classified_as: str | None = None,
+    ) -> ContractChangeRequestRecord:
+        async with self._db.session_factory() as s, s.begin():
+            row = await s.get(ContractChangeRequestRow, request_id)
+            if row is None:
+                raise NotFoundError(f"ContractChangeRequest not found: {request_id}")
+            row.status = status
+            if batch_id is not None:
+                row.batch_id = batch_id
+            if classified_as is not None:
+                row.classified_as = classified_as
+            await s.flush()
+            await s.refresh(row)
+            return _to_ccr_dto(row)
+
+    async def increment_contract_breaking_in_wave(
+        self, contract_id: str, expected_version: int
+    ) -> ContractRecord:
+        async with self._db.session_factory() as s, s.begin():
+            existing = await s.get(ContractRow, contract_id)
+            if existing is None:
+                raise NotFoundError(f"Contract not found: {contract_id}")
+            res = await s.execute(
+                update(ContractRow)
+                .where(ContractRow.id == contract_id, ContractRow.version == expected_version)
+                .values(
+                    breaking_in_wave=ContractRow.breaking_in_wave + 1,
+                    version=ContractRow.version + 1,
+                )
+            )
+            if _rowcount(res) == 0:
+                raise StaleWriteError(f"Stale write incrementing breaking_in_wave: {contract_id}")
+            s.expire(existing)
+            refreshed = await s.get(ContractRow, contract_id)
+            assert refreshed is not None
+            return _to_contract_dto(refreshed)
+
+    async def upsert_feature(
+        self,
+        run_id: str,
+        name: str,
+        *,
+        status: str = "pending",
+        budget_blackbox_tests_usd: float = 0.30,
+        spent_delta_usd: float = 0.0,
+        dispute_rounds_delta: int = 0,
+    ) -> FeatureRecord:
+        now = datetime.now(UTC)
+        async with self._db.session_factory() as s, s.begin():
+            existing = await s.get(FeatureRow, (run_id, name))
+            if existing is None:
+                row = FeatureRow(
+                    run_id=run_id,
+                    name=name,
+                    status=status,
+                    budget_blackbox_tests_usd=budget_blackbox_tests_usd,
+                    spent_blackbox_tests_usd=spent_delta_usd,
+                    dispute_rounds=dispute_rounds_delta,
+                    updated_at=now,
+                )
+                s.add(row)
+                await s.flush()
+                await s.refresh(row)
+                return _to_feature_dto(row)
+            existing.status = status
+            existing.spent_blackbox_tests_usd = (
+                float(existing.spent_blackbox_tests_usd) + spent_delta_usd
+            )
+            existing.dispute_rounds = int(existing.dispute_rounds) + dispute_rounds_delta
+            existing.updated_at = now
+            await s.flush()
+            await s.refresh(existing)
+            return _to_feature_dto(existing)
+
+    async def list_features(self, run_id: str) -> list[FeatureRecord]:
+        async with self._db.session_factory() as s:
+            rows = (
+                await s.scalars(
+                    select(FeatureRow).where(FeatureRow.run_id == run_id).order_by(FeatureRow.name)
+                )
+            ).all()
+            return [_to_feature_dto(r) for r in rows]
 
     async def get_or_create_decision(
         self,
@@ -1286,21 +1815,24 @@ class PostgresBlackboardRepository:
             res = await s.execute(
                 text(
                     """
-                    WITH batch AS (
-                        SELECT id
-                        FROM events
-                        WHERE publish_seq IS NULL
-                        ORDER BY id
-                        LIMIT :limit
+                    WITH ordered AS (
+                        SELECT id, nextval('events_publish_seq') AS seq
+                        FROM (
+                            SELECT id
+                            FROM events
+                            WHERE publish_seq IS NULL
+                            ORDER BY id
+                            LIMIT :limit
+                        ) s
                     )
-                    UPDATE events
-                    SET publish_seq = nextval('events_publish_seq'),
+                    UPDATE events e
+                    SET publish_seq = o.seq,
                         published_at = now()
-                    FROM batch
-                    WHERE events.id = batch.id
-                    RETURNING events.id, events.publish_seq, events.run_id, events.type,
-                              events.subject_id, events.payload, events.created_at,
-                              events.published_at
+                    FROM ordered o
+                    WHERE e.id = o.id
+                    RETURNING e.id, e.publish_seq, e.run_id, e.type,
+                              e.subject_id, e.payload, e.created_at,
+                              e.published_at
                     """
                 ),
                 {"limit": limit},
@@ -1366,9 +1898,13 @@ class InMemoryBlackboardRepository:
         self._tasks: dict[str, TaskRecord] = {}
         self._deps: dict[str, list[str]] = {}
         self._write_sets: dict[str, list[str]] = {}
+        self._reservations: list[WriteReservationRecord] = []
+        self._next_reservation_id = 1
         self._contracts: dict[str, ContractRecord] = {}
         self._contract_versions: dict[tuple[str, int], ContractVersionRecord] = {}
+        self._contract_subscriptions: dict[tuple[str, str], ContractSubscriptionRecord] = {}
         self._change_requests: dict[str, ContractChangeRequestRecord] = {}
+        self._features: dict[tuple[str, str], FeatureRecord] = {}
         self._decisions: dict[str, DecisionRecord] = {}
         self._decision_keys: dict[str, str] = {}
         self._threads: dict[str, dict[str, Any]] = {}
@@ -1528,6 +2064,7 @@ class InMemoryBlackboardRepository:
         task_id: str | None = None,
         base_sha: str | None = None,
         graph_thread_id: str | None = None,
+        parent_task_id: str | None = None,
     ) -> TaskRecord:
         async with self._lock:
             tid = task_id or _new_id("t")
@@ -1543,6 +2080,7 @@ class InMemoryBlackboardRepository:
                 description=description,
                 acceptance=list(acceptance),
                 status=status,
+                parent_task_id=parent_task_id,
                 base_sha=base_sha,
                 graph_thread_id=graph_thread_id,
                 budget_implement_usd=budget_implement_usd,
@@ -1635,6 +2173,239 @@ class InMemoryBlackboardRepository:
             )
             self._save_hook()
             return updated
+
+    async def increment_task_contract_reopens(
+        self, task_id: str, expected_version: int
+    ) -> TaskRecord:
+        async with self._lock:
+            cur = self._tasks.get(task_id)
+            if cur is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            if cur.version != expected_version:
+                raise StaleWriteError(f"Stale write incrementing reopens on task {task_id}")
+            updated = cur.model_copy(
+                update={
+                    "contract_reopens": cur.contract_reopens + 1,
+                    "version": cur.version + 1,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._tasks[task_id] = updated
+            self._save_hook()
+            return updated
+
+    async def update_task_pending_deps(
+        self,
+        task_id: str,
+        pending_deps: Sequence[dict[str, Any]],
+        expected_version: int,
+    ) -> TaskRecord:
+        async with self._lock:
+            cur = self._tasks.get(task_id)
+            if cur is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            if cur.version != expected_version:
+                raise StaleWriteError(f"Stale write updating pending_deps on task {task_id}")
+            updated = cur.model_copy(
+                update={
+                    "pending_deps": [dict(d) for d in pending_deps],
+                    "version": cur.version + 1,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._tasks[task_id] = updated
+            self._save_hook()
+            return updated
+
+    async def update_task_metadata(
+        self,
+        task_id: str,
+        expected_version: int,
+        *,
+        base_sha: str | None = None,
+        branch: str | None = None,
+        worktree_path: str | None = None,
+        attempt: int | None = None,
+        graph_thread_id: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> TaskRecord:
+        async with self._lock:
+            cur = self._tasks.get(task_id)
+            if cur is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            if cur.version != expected_version:
+                raise StaleWriteError(f"Stale write updating metadata on task {task_id}")
+            updates: dict[str, Any] = {
+                "version": cur.version + 1,
+                "updated_at": datetime.now(UTC),
+            }
+            if base_sha is not None:
+                updates["base_sha"] = base_sha
+            if branch is not None:
+                updates["branch"] = branch
+            if worktree_path is not None:
+                updates["worktree_path"] = worktree_path
+            if attempt is not None:
+                updates["attempt"] = attempt
+            if graph_thread_id is not None:
+                updates["graph_thread_id"] = graph_thread_id
+            if parent_task_id is not None:
+                updates["parent_task_id"] = parent_task_id
+            updated = cur.model_copy(update=updates)
+            self._tasks[task_id] = updated
+            self._save_hook()
+            return updated
+
+    async def acquire_write_reservations(
+        self,
+        run_id: str,
+        task_id: str,
+        paths: Sequence[str],
+        *,
+        ttl_seconds: int = 600,
+    ) -> tuple[list[WriteReservationRecord], list[ReservationConflict]]:
+        norm_paths = list(
+            dict.fromkeys(normalize_repo_path(p, allow_directory_slash=True) for p in paths)
+        )
+        if not norm_paths:
+            return [], []
+        async with self._lock:
+            now = datetime.now(UTC)
+            other_active = [
+                r
+                for r in self._reservations
+                if r.run_id == run_id
+                and r.task_id != task_id
+                and r.released_at is None
+                and r.expires_at > now
+            ]
+            conflicts: list[ReservationConflict] = []
+            for other in other_active:
+                for req_p, hold_p in paths_overlap(norm_paths, [other.path]):
+                    conflicts.append(
+                        ReservationConflict(
+                            requested_path=req_p,
+                            holder_task_id=other.task_id,
+                            holder_path=hold_p,
+                        )
+                    )
+            if conflicts:
+                self._append_event(
+                    run_id=run_id,
+                    event_type="reservation.denied",
+                    subject_id=task_id,
+                    payload={
+                        "task_id": task_id,
+                        "conflicts": [c.model_dump(mode="json") for c in conflicts],
+                    },
+                )
+                self._save_hook()
+                return [], conflicts
+
+            expires = now + timedelta(seconds=ttl_seconds)
+            existing_own = {
+                r.path: idx
+                for idx, r in enumerate(self._reservations)
+                if r.run_id == run_id and r.task_id == task_id and r.released_at is None
+            }
+            granted: list[WriteReservationRecord] = []
+            for path in norm_paths:
+                if path in existing_own:
+                    idx = existing_own[path]
+                    updated = self._reservations[idx].model_copy(
+                        update={"expires_at": expires, "heartbeat_at": now}
+                    )
+                    self._reservations[idx] = updated
+                    granted.append(updated)
+                else:
+                    rec = WriteReservationRecord(
+                        id=self._next_reservation_id,
+                        run_id=run_id,
+                        task_id=task_id,
+                        path=path,
+                        expires_at=expires,
+                        heartbeat_at=now,
+                    )
+                    self._next_reservation_id += 1
+                    self._reservations.append(rec)
+                    granted.append(rec)
+            self._append_event(
+                run_id=run_id,
+                event_type="reservation.granted",
+                subject_id=task_id,
+                payload={"task_id": task_id, "paths": norm_paths},
+            )
+            self._save_hook()
+            return granted, []
+
+    async def renew_write_reservations(
+        self,
+        run_id: str,
+        *,
+        task_ids: Sequence[str] | None = None,
+        ttl_seconds: int = 600,
+    ) -> int:
+        async with self._lock:
+            now = datetime.now(UTC)
+            expires = now + timedelta(seconds=ttl_seconds)
+            id_filter = set(task_ids) if task_ids is not None else None
+            if id_filter is not None and not id_filter:
+                return 0
+            renewed = 0
+            for idx, r in enumerate(self._reservations):
+                if (
+                    r.run_id == run_id
+                    and r.released_at is None
+                    and r.expires_at > now
+                    and (id_filter is None or r.task_id in id_filter)
+                ):
+                    self._reservations[idx] = r.model_copy(
+                        update={"expires_at": expires, "heartbeat_at": now}
+                    )
+                    renewed += 1
+            if renewed:
+                self._save_hook()
+            return renewed
+
+    async def release_write_reservations(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        reason: str = "released",
+    ) -> int:
+        async with self._lock:
+            now = datetime.now(UTC)
+            count = 0
+            for idx, r in enumerate(self._reservations):
+                if r.run_id == run_id and r.task_id == task_id and r.released_at is None:
+                    self._reservations[idx] = r.model_copy(update={"released_at": now})
+                    count += 1
+            if count > 0:
+                ev_type = "reservation.expired" if reason == "expired" else "reservation.released"
+                self._append_event(
+                    run_id=run_id,
+                    event_type=ev_type,
+                    subject_id=task_id,
+                    payload={"task_id": task_id, "count": count, "reason": reason},
+                )
+                self._save_hook()
+            return count
+
+    async def list_active_reservations(
+        self,
+        run_id: str,
+        *,
+        include_expired: bool = False,
+    ) -> list[WriteReservationRecord]:
+        now = datetime.now(UTC)
+        return [
+            r
+            for r in self._reservations
+            if r.run_id == run_id
+            and r.released_at is None
+            and (include_expired or r.expires_at > now)
+        ]
 
     async def save_contract_version(
         self,
@@ -1795,6 +2566,110 @@ class InMemoryBlackboardRepository:
         self, contract_id: str
     ) -> list[ContractChangeRequestRecord]:
         return [c for c in self._change_requests.values() if c.contract_id == contract_id]
+
+    async def subscribe_task_to_contract(
+        self,
+        contract_id: str,
+        task_id: str,
+        scope: Sequence[str] = (),
+    ) -> ContractSubscriptionRecord:
+        async with self._lock:
+            rec = ContractSubscriptionRecord(
+                contract_id=contract_id,
+                task_id=task_id,
+                scope=[str(x) for x in scope],
+            )
+            self._contract_subscriptions[(contract_id, task_id)] = rec
+            self._save_hook()
+            return rec
+
+    async def list_contract_subscriptions(
+        self, contract_id: str
+    ) -> list[ContractSubscriptionRecord]:
+        return [sub for (cid, _), sub in self._contract_subscriptions.items() if cid == contract_id]
+
+    async def update_contract_change_request(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        batch_id: str | None = None,
+        classified_as: str | None = None,
+    ) -> ContractChangeRequestRecord:
+        async with self._lock:
+            cur = self._change_requests.get(request_id)
+            if cur is None:
+                raise NotFoundError(f"ContractChangeRequest not found: {request_id}")
+            updates: dict[str, Any] = {"status": status}
+            if batch_id is not None:
+                updates["batch_id"] = batch_id
+            if classified_as is not None:
+                updates["classified_as"] = classified_as
+            updated = cur.model_copy(update=updates)
+            self._change_requests[request_id] = updated
+            self._save_hook()
+            return updated
+
+    async def increment_contract_breaking_in_wave(
+        self, contract_id: str, expected_version: int
+    ) -> ContractRecord:
+        async with self._lock:
+            cur = self._contracts.get(contract_id)
+            if cur is None:
+                raise NotFoundError(f"Contract not found: {contract_id}")
+            if cur.version != expected_version:
+                raise StaleWriteError(f"Stale write incrementing breaking_in_wave: {contract_id}")
+            updated = cur.model_copy(
+                update={
+                    "breaking_in_wave": cur.breaking_in_wave + 1,
+                    "version": cur.version + 1,
+                }
+            )
+            self._contracts[contract_id] = updated
+            self._save_hook()
+            return updated
+
+    async def upsert_feature(
+        self,
+        run_id: str,
+        name: str,
+        *,
+        status: str = "pending",
+        budget_blackbox_tests_usd: float = 0.30,
+        spent_delta_usd: float = 0.0,
+        dispute_rounds_delta: int = 0,
+    ) -> FeatureRecord:
+        async with self._lock:
+            now = datetime.now(UTC)
+            key = (run_id, name)
+            cur = self._features.get(key)
+            if cur is None:
+                rec = FeatureRecord(
+                    run_id=run_id,
+                    name=name,
+                    status=status,
+                    budget_blackbox_tests_usd=budget_blackbox_tests_usd,
+                    spent_blackbox_tests_usd=spent_delta_usd,
+                    dispute_rounds=dispute_rounds_delta,
+                    updated_at=now,
+                )
+            else:
+                rec = cur.model_copy(
+                    update={
+                        "status": status,
+                        "spent_blackbox_tests_usd": cur.spent_blackbox_tests_usd + spent_delta_usd,
+                        "dispute_rounds": cur.dispute_rounds + dispute_rounds_delta,
+                        "updated_at": now,
+                    }
+                )
+            self._features[key] = rec
+            self._save_hook()
+            return rec
+
+    async def list_features(self, run_id: str) -> list[FeatureRecord]:
+        items = [f for (rid, _), f in self._features.items() if rid == run_id]
+        items.sort(key=lambda f: f.name)
+        return items
 
     async def get_or_create_decision(
         self,
@@ -2122,6 +2997,10 @@ class JsonFileBlackboardRepository(InMemoryBlackboardRepository):
         self._tasks = {k: TaskRecord.model_validate(v) for k, v in raw.get("tasks", {}).items()}
         self._deps = dict(raw.get("deps", {}))
         self._write_sets = dict(raw.get("write_sets", {}))
+        self._reservations = [
+            WriteReservationRecord.model_validate(r) for r in raw.get("reservations", [])
+        ]
+        self._next_reservation_id = int(raw.get("next_reservation_id", 1))
         self._contracts = {
             k: ContractRecord.model_validate(v) for k, v in raw.get("contracts", {}).items()
         }
@@ -2129,9 +3008,17 @@ class JsonFileBlackboardRepository(InMemoryBlackboardRepository):
             (k.split("::", 1)[0], int(k.split("::", 1)[1])): ContractVersionRecord.model_validate(v)
             for k, v in raw.get("contract_versions", {}).items()
         }
+        self._contract_subscriptions = {
+            (k.split("::", 1)[0], k.split("::", 1)[1]): ContractSubscriptionRecord.model_validate(v)
+            for k, v in raw.get("contract_subscriptions", {}).items()
+        }
         self._change_requests = {
             k: ContractChangeRequestRecord.model_validate(v)
             for k, v in raw.get("change_requests", {}).items()
+        }
+        self._features = {
+            (k.split("::", 1)[0], k.split("::", 1)[1]): FeatureRecord.model_validate(v)
+            for k, v in raw.get("features", {}).items()
         }
         self._decisions = {
             k: DecisionRecord.model_validate(v) for k, v in raw.get("decisions", {}).items()
@@ -2157,13 +3044,23 @@ class JsonFileBlackboardRepository(InMemoryBlackboardRepository):
             "tasks": {k: v.model_dump(mode="json") for k, v in self._tasks.items()},
             "deps": self._deps,
             "write_sets": self._write_sets,
+            "reservations": [r.model_dump(mode="json") for r in self._reservations],
+            "next_reservation_id": self._next_reservation_id,
             "contracts": {k: v.model_dump(mode="json") for k, v in self._contracts.items()},
             "contract_versions": {
                 f"{cid}::{ver}": v.model_dump(mode="json")
                 for (cid, ver), v in self._contract_versions.items()
             },
+            "contract_subscriptions": {
+                f"{cid}::{tid}": s.model_dump(mode="json")
+                for (cid, tid), s in self._contract_subscriptions.items()
+            },
             "change_requests": {
                 k: v.model_dump(mode="json") for k, v in self._change_requests.items()
+            },
+            "features": {
+                f"{rid}::{fname}": f.model_dump(mode="json")
+                for (rid, fname), f in self._features.items()
             },
             "decisions": {k: v.model_dump(mode="json") for k, v in self._decisions.items()},
             "decision_keys": self._decision_keys,

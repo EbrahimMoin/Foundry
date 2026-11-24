@@ -201,3 +201,105 @@ class HardenedGit:
             if len(parts) == 3:
                 entries.append({"sha": parts[0], "author": parts[1], "subject": parts[2]})
         return entries
+
+    async def head_sha(self, repo_or_wt: Path, ref: str = "HEAD") -> str:
+        out = await self._run_checked(repo_or_wt, ["rev-parse", ref])
+        return out.strip()
+
+    async def branch_exists(self, repo_dir: Path, branch: str) -> bool:
+        rc, _, _ = await self._run_git(
+            repo_dir, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]
+        )
+        return rc == 0
+
+    async def delete_branch(self, repo_dir: Path, branch: str, *, force: bool = True) -> None:
+        flag = "-D" if force else "-d"
+        await self._run_checked(repo_dir, ["branch", flag, branch])
+
+    async def checkout_branch(self, repo_or_wt: Path, branch: str) -> None:
+        await self._run_checked(repo_or_wt, ["checkout", branch])
+
+    async def conflicted_files(self, worktree_dir: Path) -> list[str]:
+        out = await self._run_checked(worktree_dir, ["diff", "--name-only", "--diff-filter=U"])
+        return [normalize_repo_path(line.strip()) for line in out.splitlines() if line.strip()]
+
+    async def rebase_onto(
+        self,
+        worktree_dir: Path,
+        target_ref: str,
+        *,
+        author_name: str = "Foundry Agent",
+        author_email: str = "agent@foundry.local",
+    ) -> tuple[bool, list[str]]:
+        await asyncio.to_thread(validate_workspace_tree, worktree_dir, ignore_git_dir=True)
+        rc, _, _ = await self._run_git(
+            worktree_dir,
+            [
+                "-c",
+                f"user.name={author_name}",
+                "-c",
+                f"user.email={author_email}",
+                "rebase",
+                target_ref,
+            ],
+        )
+        if rc == 0:
+            await self.assert_no_git_symlinks(worktree_dir)
+            return True, []
+        conflicts = await self.conflicted_files(worktree_dir)
+        return False, conflicts
+
+    async def abort_rebase(self, worktree_dir: Path) -> None:
+        await self._run_git(worktree_dir, ["rebase", "--abort"])
+
+    async def continue_rebase(
+        self,
+        worktree_dir: Path,
+        *,
+        author_name: str = "Foundry Agent",
+        author_email: str = "agent@foundry.local",
+    ) -> tuple[bool, list[str]]:
+        await asyncio.to_thread(validate_workspace_tree, worktree_dir, ignore_git_dir=True)
+        await self._run_checked(worktree_dir, ["add", "-A"])
+        await self.assert_no_git_symlinks(worktree_dir)
+        rc, _, _ = await self._run_git(
+            worktree_dir,
+            [
+                "-c",
+                f"user.name={author_name}",
+                "-c",
+                f"user.email={author_email}",
+                "-c",
+                "core.editor=true",
+                "rebase",
+                "--continue",
+            ],
+        )
+        if rc == 0:
+            return True, []
+        conflicts = await self.conflicted_files(worktree_dir)
+        return False, conflicts
+
+    async def fast_forward_branch(self, repo_dir: Path, target_branch: str, source_ref: str) -> str:
+        await self._run_checked(repo_dir, ["checkout", target_branch])
+        await self._run_checked(repo_dir, ["merge", "--ff-only", source_ref])
+        return await self.head_sha(repo_dir, target_branch)
+
+    async def enforce_diff_write_set(
+        self,
+        worktree_dir: Path,
+        base_ref: str,
+        write_set: Sequence[str],
+        *,
+        allow_infra: bool = False,
+    ) -> list[str]:
+        await asyncio.to_thread(validate_workspace_tree, worktree_dir, ignore_git_dir=True)
+        await self.assert_no_git_symlinks(worktree_dir)
+        changed = await self.diff_names(worktree_dir, base_ref)
+        for path in changed:
+            if is_forbidden_git_meta(path, allow_infra=allow_infra):
+                raise ForbiddenGitMetaError(f"Forbidden git metadata change: {path}")
+        offending = [p for p in changed if not path_in_write_set(p, write_set)]
+        if offending:
+            raise WriteSetViolationError(offending, write_set)
+        return changed

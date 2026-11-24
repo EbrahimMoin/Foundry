@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from foundry.sandbox.protocol import ExecPriority, Sandbox, SandboxProvider
+from foundry.sandbox.semaphore import HeavyExecSemaphore
 from foundry.sandbox.workspace_sync import sync_workspace_to_worktree
 from foundry.security.hardened_git import HardenedGit
 from foundry.security.scanner import SecretScanner
@@ -89,6 +90,7 @@ class GateRunner:
         run_schemathesis: bool = True,
         scanner: SecretScanner | None = None,
         allow_infra: bool = False,
+        semaphore: HeavyExecSemaphore | None = None,
     ) -> None:
         self._provider = provider
         self._sandbox = sandbox
@@ -103,13 +105,25 @@ class GateRunner:
         self._run_schemathesis = run_schemathesis
         self._scanner = scanner or SecretScanner()
         self._allow_infra = allow_infra
+        self._semaphore = semaphore
 
-    def _sandbox_checks(self, *, g2: bool) -> list[tuple[str, list[str], bool]]:
-        backend_targets = [p for p in self._write_set if p.startswith("backend/")]
+    def _sandbox_checks(
+        self,
+        *,
+        g2: bool,
+        full_suite: bool = False,
+    ) -> list[tuple[str, list[str], bool]]:
+        backend_targets = (
+            ["backend/"] if full_suite else [p for p in self._write_set if p.startswith("backend/")]
+        )
         ruff_targets = backend_targets if backend_targets else ["backend/"]
-        mypy_targets = [
-            p for p in backend_targets if p != "backend/" and not p.startswith("backend/tests")
-        ]
+        mypy_targets = (
+            ["backend/app"]
+            if full_suite
+            else [
+                p for p in backend_targets if p != "backend/" and not p.startswith("backend/tests")
+            ]
+        )
         if not mypy_targets:
             mypy_targets = ["backend/app"]
 
@@ -201,16 +215,22 @@ class GateRunner:
 
         return violations, str(exported_abs)
 
-    async def _run_sandbox_sequence(self, *, g2: bool) -> tuple[list[CheckOutcome], bool]:
+    async def _run_sandbox_sequence(
+        self,
+        *,
+        g2: bool,
+        priority: ExecPriority = ExecPriority.IMPLEMENT_G1_G2,
+        full_suite: bool = False,
+    ) -> tuple[list[CheckOutcome], bool]:
         outcomes: list[CheckOutcome] = []
         aborted = False
-        for name, cmd, blocking in self._sandbox_checks(g2=g2):
+        for name, cmd, blocking in self._sandbox_checks(g2=g2, full_suite=full_suite):
             res = await self._provider.exec(
                 self._sandbox,
                 cmd,
                 network=False,
                 heavy=True,
-                priority=ExecPriority.IMPLEMENT_G1_G2,
+                priority=priority,
             )
             passed = res.exit_code == 0 and not res.timed_out
             outcomes.append(
@@ -229,6 +249,14 @@ class GateRunner:
                 aborted = True
                 break
         return outcomes, aborted
+
+    async def _run_host_scanners_locked(
+        self, scan_target: Path, *, priority: ExecPriority
+    ) -> list[CheckOutcome]:
+        if self._semaphore is not None:
+            async with self._semaphore.acquire(priority=priority):
+                return await asyncio.to_thread(run_optional_host_scanners, scan_target)
+        return await asyncio.to_thread(run_optional_host_scanners, scan_target)
 
     async def run_g1(self) -> GateReport:
         """Execute Gate G1: sequential write-set checks + OpenAPI contract validation."""
@@ -323,15 +351,96 @@ class GateRunner:
 
         scan_target = self._worktree_dir or self._sandbox.workspace_dir
         checks.extend(
-            await asyncio.to_thread(
-                run_optional_host_scanners,
+            await self._run_host_scanners_locked(
                 scan_target,
+                priority=ExecPriority.IMPLEMENT_G1_G2,
             )
         )
 
         blocking_ok = all(c.passed for c in checks if c.blocking)
         return GateReport(
             gate=GateName.G2,
+            passed=blocking_ok and not violations,
+            checks=checks,
+            violations=violations,
+            exported_openapi_path=exported_path,
+        )
+
+    async def run_g5(
+        self,
+        *,
+        base_sha: str | None = None,
+        extra_allowed_paths: Sequence[str] = (),
+    ) -> GateReport:
+        """Execute Gate G5: merge-queue combined-code verification with top semaphore priority."""
+        checks: list[CheckOutcome] = []
+        violations: list[ContractViolation] = []
+        allowed_set = [*self._write_set, *extra_allowed_paths]
+
+        try:
+            await asyncio.to_thread(
+                validate_workspace_tree,
+                self._sandbox.workspace_dir,
+                ignore_git_dir=False,
+            )
+            if (
+                self._git is not None
+                and self._worktree_dir is not None
+                and base_sha
+                and allowed_set
+            ):
+                await self._git.enforce_diff_write_set(
+                    self._worktree_dir,
+                    base_sha,
+                    allowed_set,
+                    allow_infra=self._allow_infra,
+                )
+            checks.append(CheckOutcome(name="merge_diff_guard", passed=True, detail="passed"))
+        except Exception as exc:
+            checks.append(
+                CheckOutcome(
+                    name="merge_diff_guard",
+                    passed=False,
+                    exit_code=1,
+                    detail=str(exc),
+                    stderr=str(exc),
+                )
+            )
+            return GateReport(gate=GateName.G5, passed=False, checks=checks, violations=violations)
+
+        sandbox_outcomes, aborted = await self._run_sandbox_sequence(
+            g2=True,
+            priority=ExecPriority.MERGE_QUEUE_G5,
+            full_suite=True,
+        )
+        checks.extend(sandbox_outcomes)
+
+        exported_path: str | None = None
+        if not aborted:
+            contract_violations, exported_path = await asyncio.to_thread(
+                self._run_host_contract_checks
+            )
+            violations.extend(contract_violations)
+
+        violations.extend(
+            await asyncio.to_thread(
+                scan_workspace_secrets,
+                self._sandbox.workspace_dir,
+                self._scanner,
+            )
+        )
+
+        scan_target = self._worktree_dir or self._sandbox.workspace_dir
+        checks.extend(
+            await self._run_host_scanners_locked(
+                scan_target,
+                priority=ExecPriority.MERGE_QUEUE_G5,
+            )
+        )
+
+        blocking_ok = all(c.passed for c in checks if c.blocking)
+        return GateReport(
+            gate=GateName.G5,
             passed=blocking_ok and not violations,
             checks=checks,
             violations=violations,

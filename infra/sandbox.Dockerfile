@@ -14,33 +14,35 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && corepack enable \
     && corepack prepare pnpm@9.15.4 --activate
 
-# Install uv and pre-bake standard stack-pack Python check/runtime tooling
-RUN pip install --no-cache-dir \
-    uv \
-    ruff \
-    mypy \
-    pytest \
-    pytest-asyncio \
-    httpx \
-    fastapi \
-    sqlalchemy \
-    alembic \
-    pydantic \
-    pydantic-settings \
-    pyjwt \
-    asyncpg \
-    pyyaml \
-    uvicorn \
-    email-validator \
-    schemathesis
-
-# Create non-root sandbox user (uid 1000) with no git installed
+# Create writable pre-baked /opt/venv + non-root user (uid 1000) with no git installed (A8-2)
 RUN groupadd --gid 1000 foundry \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash foundry \
-    && mkdir -p /workspace /tmp \
-    && chown -R 1000:1000 /workspace
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir \
+        uv \
+        ruff \
+        mypy \
+        pytest \
+        pytest-asyncio \
+        httpx \
+        fastapi \
+        sqlalchemy \
+        alembic \
+        pydantic \
+        pydantic-settings \
+        pyjwt \
+        asyncpg \
+        pyyaml \
+        uvicorn \
+        email-validator \
+        schemathesis \
+    && mkdir -p /workspace/frontend/node_modules /tmp \
+    && chown -R 1000:1000 /opt/venv /workspace
 
 ENV HOME=/home/foundry \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:/usr/local/bin:/usr/bin:/bin" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/workspace/backend \

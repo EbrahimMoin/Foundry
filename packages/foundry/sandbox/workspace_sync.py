@@ -63,8 +63,11 @@ def sync_worktree_to_workspace(worktree_dir: Path, workspace_dir: Path) -> None:
 
     for dirpath, dirnames, filenames in os.walk(worktree_dir, topdown=True, followlinks=False):
         current = Path(dirpath)
-        if current == worktree_dir and ".git" in dirnames:
-            dirnames.remove(".git")
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d != "node_modules" and not (current == worktree_dir and d == ".git")
+        ]
         if current == worktree_dir and ".git" in filenames:
             filenames.remove(".git")
 

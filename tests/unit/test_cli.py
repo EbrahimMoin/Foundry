@@ -203,3 +203,11 @@ def test_cli_run_start_status_and_resume_offline(tmp_path: Path) -> None:
     assert status_res.exit_code == 0, status_res.stdout
     assert "4/4" in status_res.stdout
     assert "MERGED" in status_res.stdout
+    assert "Reopens" in status_res.stdout
+
+    locks_res = runner.invoke(
+        app,
+        ["run", "locks", run_id, "--state-file", str(state_file)],
+    )
+    assert locks_res.exit_code == 0, locks_res.stdout
+    assert "No active write reservations" in locks_res.stdout

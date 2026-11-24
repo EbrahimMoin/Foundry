@@ -29,6 +29,7 @@ class Sandbox(BaseModel):
     image: str
     db_name: str | None = None
     database_url: str | None = None
+    ephemeral_volumes: list[str] = Field(default_factory=list)
 
 
 class ExecResult(BaseModel):

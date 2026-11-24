@@ -88,7 +88,13 @@ class AgentRow(BlackboardBase):
 
 class TaskRow(BlackboardBase):
     __tablename__ = "tasks"
-    __table_args__ = (Index("tasks_run_status", "run_id", "status"),)
+    __table_args__ = (
+        Index("tasks_run_status", "run_id", "status"),
+        CheckConstraint(
+            "kind IN ('build', 'schema', 'delta', 'fix', 'integration', 'deps', 'verify')",
+            name="ck_tasks_kind",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False)
@@ -588,6 +594,30 @@ class LlmCallRecord(BaseModel):
     created_at: datetime
 
 
+class FeatureRow(BlackboardBase):
+    __tablename__ = "features"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'in_progress', 'verified', 'merged', 'failed')",
+            name="ck_features_status",
+        ),
+    )
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    budget_blackbox_tests_usd: Mapped[float] = mapped_column(
+        Numeric(8, 4), nullable=False, default=0.30
+    )
+    spent_blackbox_tests_usd: Mapped[float] = mapped_column(
+        Numeric(8, 4), nullable=False, default=0.0
+    )
+    dispute_rounds: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class BlackboardEvent(BaseModel):
     id: int
     publish_seq: int | None = None
@@ -597,3 +627,35 @@ class BlackboardEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     published_at: datetime | None = None
+
+
+class FeatureRecord(BaseModel):
+    run_id: str
+    name: str
+    status: str = "pending"
+    budget_blackbox_tests_usd: float = 0.30
+    spent_blackbox_tests_usd: float = 0.0
+    dispute_rounds: int = 0
+    updated_at: datetime
+
+
+class WriteReservationRecord(BaseModel):
+    id: int
+    run_id: str
+    task_id: str
+    path: str
+    expires_at: datetime
+    heartbeat_at: datetime
+    released_at: datetime | None = None
+
+
+class ReservationConflict(BaseModel):
+    requested_path: str
+    holder_task_id: str
+    holder_path: str
+
+
+class ContractSubscriptionRecord(BaseModel):
+    contract_id: str
+    task_id: str
+    scope: list[str] = Field(default_factory=list)

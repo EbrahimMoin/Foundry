@@ -7,6 +7,7 @@ from foundry.supervisor.runner import (
     TaskExecutor,
     create_postgres_saver_context,
 )
+from foundry.supervisor.scheduler import ParallelWaveScheduler
 from foundry.supervisor.waves import (
     WavePlanTask,
     advance_ready_tasks,
@@ -17,6 +18,7 @@ from foundry.supervisor.waves import (
 
 __all__ = [
     "JsonFileCheckpointSaver",
+    "ParallelWaveScheduler",
     "RunStateSummary",
     "RunSupervisor",
     "TaskExecutor",

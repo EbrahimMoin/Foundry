@@ -13,6 +13,7 @@ class GateName(StrEnum):
 
     G1 = "G1"
     G2 = "G2"
+    G5 = "G5"
 
 
 class CheckOutcome(BaseModel):

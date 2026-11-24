@@ -986,14 +986,68 @@ def run_status(
     if summary.tasks:
         task_tbl = Table(title="Tasks")
         task_tbl.add_column("ID", style="cyan", no_wrap=True, overflow="fold")
-        task_tbl.add_column("Wave")
-        task_tbl.add_column("Domain")
+        task_tbl.add_column("W", no_wrap=True)
+        task_tbl.add_column("Domain", no_wrap=True)
         task_tbl.add_column("Feature")
-        task_tbl.add_column("Kind")
-        task_tbl.add_column("Status")
+        task_tbl.add_column("Kind", no_wrap=True)
+        task_tbl.add_column("Status", min_width=11, no_wrap=True)
+        task_tbl.add_column("Reopens", no_wrap=True)
         for t in summary.tasks:
-            task_tbl.add_row(t.id, str(t.wave), t.domain, t.feature or "-", t.kind, t.status.value)
+            task_tbl.add_row(
+                t.id,
+                str(t.wave),
+                t.domain,
+                t.feature or "-",
+                t.kind,
+                t.status.value,
+                f"{t.attempt}/{t.max_attempts} (r{t.contract_reopens})",
+            )
         console.print(task_tbl)
+
+
+@run_app.command("locks")
+def run_locks(
+    run_id: Annotated[str, typer.Argument(help="Run ID to inspect active write reservations")],
+    include_expired: Annotated[
+        bool,
+        typer.Option("--include-expired", help="Include expired unreleased reservations"),
+    ] = False,
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file"),
+    ] = None,
+) -> None:
+    """List active prefix-checked write_reservations for a Foundry run."""
+
+    async def _fetch() -> list[Any]:
+        repo, db = _open_blackboard(dsn, state_file)
+        try:
+            return await repo.list_active_reservations(run_id, include_expired=include_expired)
+        finally:
+            if db is not None:
+                await db.aclose()
+
+    locks = asyncio.run(_fetch())
+    if not locks:
+        console.print(f"[green]No active write reservations for {run_id}.[/green]")
+        return
+
+    tbl = Table(title=f"Write Reservations ({run_id})")
+    tbl.add_column("ID", style="cyan", no_wrap=True, overflow="fold")
+    tbl.add_column("Task ID", no_wrap=True, overflow="fold")
+    tbl.add_column("Path")
+    tbl.add_column("Heartbeat")
+    tbl.add_column("Expires")
+    for lock in locks:
+        tbl.add_row(
+            str(lock.id),
+            lock.task_id,
+            lock.path,
+            lock.heartbeat_at.isoformat(),
+            lock.expires_at.isoformat(),
+        )
+    console.print(tbl)
 
 
 @run_app.command("resume")

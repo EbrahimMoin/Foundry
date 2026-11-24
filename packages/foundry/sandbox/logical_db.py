@@ -142,7 +142,7 @@ class LogicalDBManager:
             await self._acquire_template_lock(conn)
             try:
                 await self._terminate_connections(conn, self._template_db)
-                await conn.execute(f"DROP DATABASE IF EXISTS {db_name}")
+                await conn.execute(f"DROP DATABASE IF EXISTS {db_name} WITH (FORCE)")
                 await conn.execute(f"DROP ROLE IF EXISTS {role_name}")
                 # Use parameterized quoted literal style isn't accepted for PASSWORD in CREATE ROLE,
                 # and password is strictly URL-safe [A-Za-z0-9_-], so single-quoting is safe.
@@ -175,7 +175,7 @@ class LogicalDBManager:
         conn = await self._connect_fn(self._admin_dsn)
         try:
             await self._terminate_connections(conn, db_name)
-            await conn.execute(f"DROP DATABASE IF EXISTS {db_name}")
+            await conn.execute(f"DROP DATABASE IF EXISTS {db_name} WITH (FORCE)")
             await conn.execute(f"DROP ROLE IF EXISTS {role_name}")
         finally:
             await conn.close()

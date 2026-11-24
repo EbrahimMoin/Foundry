@@ -34,6 +34,7 @@ class LocalDockerProvider:
         sandbox_db_network: str = "foundry_sandbox_db",
         egress_network: str = "foundry_sandbox_egress",
         proxy_url: str = "http://foundry-egress-proxy:8888",
+        mount_dep_volumes: bool = True,
     ) -> None:
         self._runtime_cfg = runtime_cfg
         self._semaphore = semaphore
@@ -42,6 +43,7 @@ class LocalDockerProvider:
         self._sandbox_db_network = sandbox_db_network
         self._egress_network = egress_network
         self._proxy_url = proxy_url
+        self._mount_dep_volumes = mount_dep_volumes
         self._client: Any | None = None
 
     def _get_client(self) -> Any:
@@ -78,6 +80,7 @@ class LocalDockerProvider:
 
         limits = self._runtime_cfg.sandbox_limits
         merged_env = {
+            "VIRTUAL_ENV": "/opt/venv",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": "/workspace/backend",
             "MYPYPATH": "/workspace/backend",
@@ -90,6 +93,25 @@ class LocalDockerProvider:
         }
         container_name = f"foundry-sbx-{task_id}"
         container_tmpfs = {"/tmp": "rw,noexec,nosuid,size=256m"}  # noqa: S108
+        volumes: dict[str, dict[str, str]] = {
+            str(resolved_ws): {"bind": "/workspace", "mode": "rw"}
+        }
+        ephemeral_volumes: list[str] = []
+        if self._mount_dep_volumes:
+            safe_vol_id = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in task_id)
+            venv_vol = f"foundry-venv-{safe_vol_id}"
+            volumes[venv_vol] = {"bind": "/opt/venv", "mode": "rw"}
+            ephemeral_volumes.append(venv_vol)
+            if (resolved_ws / "frontend").is_dir():
+                await asyncio.to_thread(
+                    (resolved_ws / "frontend" / "node_modules").mkdir,
+                    parents=True,
+                    exist_ok=True,
+                )
+                nm_vol = f"foundry-nm-{safe_vol_id}"
+                volumes[nm_vol] = {"bind": "/workspace/frontend/node_modules", "mode": "rw"}
+                ephemeral_volumes.append(nm_vol)
+
         run_kwargs: dict[str, Any] = {
             "image": image,
             "name": container_name,
@@ -106,7 +128,7 @@ class LocalDockerProvider:
             "pids_limit": limits.pids,
             "network": self._sandbox_db_network,
             "dns": ["127.0.0.1"],
-            "volumes": {str(resolved_ws): {"bind": "/workspace", "mode": "rw"}},
+            "volumes": volumes,
             "environment": merged_env,
         }
 
@@ -118,6 +140,7 @@ class LocalDockerProvider:
             workspace_dir=resolved_ws,
             image=image,
             database_url=env.get("DATABASE_URL"),
+            ephemeral_volumes=ephemeral_volumes,
         )
 
     async def _run_exec_sync(
@@ -201,8 +224,17 @@ class LocalDockerProvider:
         client = self._get_client()
         try:
             container = await asyncio.to_thread(client.containers.get, sandbox.container_id)
+            await asyncio.to_thread(container.remove, force=True)
         except Exception as exc:
-            if type(exc).__name__ == "NotFound":
-                return
-            raise
-        await asyncio.to_thread(container.remove, force=True)
+            if type(exc).__name__ != "NotFound":
+                raise
+
+        volumes_api = getattr(client, "volumes", None)
+        if volumes_api is not None:
+            for vol_name in sandbox.ephemeral_volumes:
+                try:
+                    vol = await asyncio.to_thread(volumes_api.get, vol_name)
+                    await asyncio.to_thread(vol.remove, force=True)
+                except Exception as exc:
+                    if type(exc).__name__ != "NotFound":
+                        raise
