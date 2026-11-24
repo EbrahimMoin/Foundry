@@ -1,0 +1,2 @@
+# Foundry
+Personal ai project 
