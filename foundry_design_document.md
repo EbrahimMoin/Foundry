@@ -4,7 +4,7 @@
 You open Foundry on your computer, describe the app you want, and a hierarchy of AI agents designs it, builds it in parallel on one codebase under formal conflict control, verifies it, and deploys it through a gated CI/CD pipeline. You supervise and make decisions from a CLI inbox and web dashboard.
 
 > **v1.4** upgrades v1.3 with major **supply-chain, ToS, security, runtime-correctness, and MIV-simplification fixes (`A7-1` to `A7-13`)**:
-> 1. **Zero LiteLLM — First-Party SDK Transports + Supply-Chain Hardening (`A7-1`):** Removed `litellm` completely following its 2026 PyPI/Docker supply-chain compromises (`v1.82.7`/`v1.82.8`, `v1.107.0`). Replaced it with 3 thin first-party SDK adapters (`openai_compat` via `openai`, `google_genai` via `google-genai`, `anthropic` via `anthropic`) + hash-verified `uv.lock` (`--frozen`/`--require-hashes`), 3–7 day PyPI release-age cooldown (`exclude-newer`), and `sha256`-pinned Docker images.
+> 1. **Zero LiteLLM — First-Party SDK Transports + Supply-Chain Hardening (`A7-1`):** Removed `litellm` completely following its 2026 PyPI/Docker supply-chain compromises (`v1.82.7`/`v1.82.8`, `v1.107.0`). Replaced it with 3 thin first-party SDK adapters (`openai_compat` via `openai`, `google_genai` via `google-genai`, `anthropic` via `anthropic`) + hash-verified `uv.lock` (`uv sync --frozen`, which verifies lockfile SHA-256 hashes automatically; `--require-hashes` applies only to `uv pip`), 3–7 day PyPI release-age cooldown (`exclude-newer`), and `sha256`-pinned Docker images.
 > 2. **Honest API-First Model Strategy (`A7-2`):** Dropped multi-step ReAct `cli_bridge` loops and removed `"100% ToS-compliant CLI bridge"` claims (vendors actively restrict automated third-party harnesses over consumer OAuth subscriptions). Official API keys + local Ollama/vLLM are the default; `ModelTransport` remains pluggable for any future opt-in single-shot adapter.
 > 3. **Host Escape, Symlink, Network & `.git` Isolation Fixes (`A7-3`, `A7-4`):** Export `openapi.json` strictly inside Docker; reject symlinks (git mode `120000`), FIFOs, and YAML bombs before any host tool reads a worktree; isolate the sandbox workspace without `/dev/null` `.git` bind-mounts; block sandbox access to the blackboard DB (`REVOKE CONNECT … FROM PUBLIC`) and external DNS.
 > 4. **Lean Local Daemon Architecture (`A7-5`, `A7-6`, `A7-11`, `A7-12`):** Dropped Redis in v1 in favor of Postgres `events` + `LISTEN/NOTIFY` + serialized monotonic `publish_seq`; switched from idle container slots to a **2-slot heavy-execution semaphore**; reconciled budget caps + added per-run kill-switches; simplified v1 decisions to `Auto` vs `Approve` + **CLI Decision Inbox**; deferred Redis Streams, `Notify+Undo`, Mergiraf/dynamic write-set expansion, and Stage A Cloud Deploy to the **Post-MIV Expansion Backlog** (Section 26.2).
@@ -26,7 +26,7 @@ You open Foundry on your computer, describe the app you want, and a hierarchy of
 11. Verification and quality gates
 12. Stack packs
 13. CI/CD and deployment
-14. Infrastructure as code (Terraform + infra-mcp)
+14. Infrastructure as code (Terraform + infra-mcp) (Post-MIV)
 15. MCP tool layer
 16. Model gateway: first-party SDK transports & supply-chain safety
 17. Human-in-the-loop decision system
@@ -270,11 +270,11 @@ autoMemoryReclaim=gradual
 | Property | Value |
 |---|---|
 | Image | `ghcr.io/<you>/foundry-sandbox-fastapi-react@sha256:<digest>` (**digest-pinned**, never `:latest`) with Python 3.12, Node 22, `uv`, `pnpm`, and the stack pack's standard dependencies **pre-installed**. No Playwright browsers (those live only in the release env image). Boots in about 1 s. |
-| Mounts & `.git` isolation (`A7-4`) | The container mounts a **`.git`-free workspace directory** synced from/to the daemon's git worktree (so `/workspace/.git` **does not exist** inside Docker — avoiding broken `hatchling`/`pytest`/`ruff`/`vite` tooling caused by `/dev/null` bind-mounts). The repo's `.git` dir is **never mounted**. `uv` cache and `pnpm` store mounted **read-only**. |
-| Database isolation (`A7-3`, `A7-9`) | `DATABASE_URL` for a logical DB `sbx_<task>` created via `CREATE DATABASE sbx_<task> TEMPLATE app_template` under a Postgres advisory lock (with startup cleanup + `pg_terminate_backend` before template refreshes). `REVOKE CONNECT ON DATABASE foundry_blackboard FROM PUBLIC` ensures sandbox DB credentials can connect **only** to `sbx_<task>` and can never reach the blackboard or checkpoint tables. Dropped on cleanup. |
+| Mounts & `.git` isolation (`A7-4`, `A8-2`) | The container mounts a **`.git`-free workspace directory** synced from/to the daemon's git worktree (so `/workspace/.git` **does not exist** inside Docker — avoiding broken `hatchling`/`pytest`/`ruff`/`vite` tooling caused by `/dev/null` bind-mounts). The repo's `.git` dir is **never mounted**. Pre-baked Python virtualenv (`/opt/venv`) and frontend dependencies (`/workspace/frontend/node_modules`) use **writable container-only Docker volumes** (seeded from image layers owned by uid `1000`, destroyed with the container, and excluded from host sync — leaving host `workspaces/<task_id>/frontend/node_modules` as an empty mountpoint directory with **zero symlinks** on the host). `uv` cache and `pnpm` store mounted **read-only**. |
+| Database isolation (`A7-3`, `A7-9`, `A8-5`) | `DATABASE_URL` for a logical DB `sbx_<task>` created via `CREATE DATABASE sbx_<task> TEMPLATE app_template` under a Postgres advisory lock (with startup cleanup, post-migration `pg_terminate_backend` before `ALLOW_CONNECTIONS = false`, and `DROP DATABASE ... WITH (FORCE)` on re-clone/teardown). `REVOKE CONNECT ON DATABASE foundry_blackboard FROM PUBLIC` + unprivileged `role_sbx_<task>` ensures sandbox DB credentials can connect **only** to `sbx_<task>` and can never reach the blackboard or checkpoint tables. Dropped on cleanup. |
 | Limits | `--memory=1.5g --cpus=1.5 --pids-limit=512`, `NODE_OPTIONS=--max-old-space-size=768` |
-| Hardening | Non-root user, `--cap-drop=ALL`, `no-new-privileges`, read-only root filesystem + tmpfs `/tmp`, default seccomp, **never the Docker socket** |
-| Network (`A7-3`, `A7-10`) | Dedicated internal Docker network (`internal: true`, **no external egress and no external DNS resolution**). The host daemon and blackboard DB are unreachable from the sandbox network. `HTTP(S)_PROXY` → egress proxy (allowlist: `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`) is injected **strictly into the single approved `install_package` `docker exec` call**, never in the container's default environment. |
+| Hardening | Non-root user, `--cap-drop=ALL`, `no-new-privileges`, read-only root filesystem + tmpfs `/tmp` + writable container-only Docker volumes at `/opt/venv` and `/workspace/frontend/node_modules` (never synced to host), default seccomp, **never the Docker socket** |
+| Network (`A7-3`, `A7-10`, `A8-5`) | Dedicated internal Docker network (`internal: true`, **no external egress and no external DNS resolution**). The host daemon is network-unreachable from the sandbox; the shared Postgres container is reachable on port `5432` solely for `sbx_<task>`, while `foundry_blackboard` is isolated at the PostgreSQL privilege layer (dedicated unprivileged `role_sbx_<task>` + `REVOKE CONNECT ON DATABASE foundry_blackboard FROM PUBLIC`). `HTTP(S)_PROXY` → egress proxy (allowlist: `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`) is injected **strictly into the single approved `install_package` `docker exec` call**, never in the container's default environment. |
 | Secrets | **None.** No LLM API keys or deploy tokens ever enter a sandbox. All LLM calls happen in the daemon. |
 
 > **Why containers and not just host venvs?** Container overhead itself is small (tens of MB). The memory goes to the processes inside (tsc, pytest). Containers give us the network jail, path jail, and resource caps that host venvs can't. Separating idle containers from the **2-slot heavy-execution semaphore** prevents LLM network latency from wasting RAM slots.
@@ -413,7 +413,7 @@ async def approve_requirements(state: ProjectState, config) -> dict:
     decision = await decisions.get_or_create(
         idempotency_key=key, category="strategic",
         title="Approve requirements", payload=state["requirements_draft"], thread_id=tid)
-    if decision.resolved_without_human:                 # Auto / Notify modes
+    if decision.resolved_without_human:                 # Auto mode
         return {"requirements": state["requirements_draft"]}
     answer = interrupt({"decision_id": decision.id})    # pauses ONLY this thread
     if answer["action"] == "approve":
@@ -528,7 +528,8 @@ CREATE TABLE tasks (
   wave                 smallint NOT NULL,              -- 1 foundation, 2 features, 3 release/fix
   domain               text NOT NULL,
   feature              text,
-  kind                 text NOT NULL DEFAULT 'build',  -- build|schema|delta|fix|integration|deps
+  kind                 text NOT NULL DEFAULT 'build'
+                       CHECK (kind IN ('build','schema','delta','fix','integration','deps','verify')),
   title                text NOT NULL,
   description          text NOT NULL,
   acceptance           jsonb NOT NULL DEFAULT '[]',
@@ -552,6 +553,18 @@ CREATE TABLE tasks (
   updated_at           timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX tasks_run_status ON tasks (run_id, status);
+
+CREATE TABLE features (
+  run_id                    text NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  name                      text NOT NULL,
+  status                    text NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending','in_progress','verified','merged','failed')),
+  budget_blackbox_tests_usd numeric(8,4) NOT NULL DEFAULT 0.30,
+  spent_blackbox_tests_usd  numeric(8,4) NOT NULL DEFAULT 0,
+  dispute_rounds            smallint NOT NULL DEFAULT 0, -- capped at 2 (section 9.7)
+  updated_at                timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (run_id, name)
+);
 
 CREATE TABLE task_dependencies (
   task_id            text REFERENCES tasks(id) ON DELETE CASCADE,
@@ -789,12 +802,22 @@ async def relay_loop(dispatcher):
         async with db.begin() as s:
             await s.execute(text("SELECT pg_advisory_xact_lock(hashtext('events:publish'))"))
             rows = await s.execute(text("""
-                UPDATE events
-                SET publish_seq = nextval('events_publish_seq'), published_at = now()
-                WHERE id IN (SELECT id FROM events WHERE publish_seq IS NULL ORDER BY id LIMIT 500)
-                RETURNING publish_seq, run_id, type, subject_id, payload
+                WITH ordered AS (
+                    SELECT id, nextval('events_publish_seq') AS seq
+                    FROM (
+                        SELECT id FROM events
+                        WHERE publish_seq IS NULL
+                        ORDER BY id
+                        LIMIT 500
+                    ) s
+                )
+                UPDATE events e
+                SET publish_seq = o.seq, published_at = now()
+                FROM ordered o
+                WHERE e.id = o.id
+                RETURNING e.publish_seq, e.run_id, e.type, e.subject_id, e.payload
             """))
-            published = rows.fetchall()
+            published = sorted(rows.fetchall(), key=lambda r: r.publish_seq)
         for event in published:
             await dispatcher.dispatch(event)          # fans out to supervisor/leads/ws_bridge
 
@@ -812,15 +835,14 @@ async def handle_event(group: str, event, handler):
 |---|---|---|
 | `task.*` (`ready`, `in_progress`, `in_review`, `verified`, `queued`, `merged`, `failed`, `escalated`, `frozen`) | Task lifecycle | Supervisor, Leads, Dashboard |
 | `reservation.granted/denied/expired/released` | Write-set reservations | Supervisor, Dashboard |
-| `writeset.expansion_requested/granted/denied` | Mid-task expansion | Supervisor, metrics |
 | `contract.change_requested/batched/versioned/frozen/locked` | Contract protocol | Leads, subscribed tasks, Project graph |
 | `wave.completed` | All of a wave's tasks are MERGED | Project graph (resume) |
 | `main.updated` | Merge queue merge | Indexer, running threads (buffered) |
-| `decision.created/resolved/undone` | Decisions | Dashboard, Decision Service |
+| `decision.created/resolved` | Decisions | Dashboard, Decision Service |
 | `test.dispute_opened/resolved` | G3 disputes | Leads, Dashboard |
 | `ci.*`, `release.*`, `incident.*` | Pipeline | Release Agent, owning domain, Dashboard |
 | `budget.warning/exceeded` | Cost thresholds | Supervisor, Dashboard |
-| `ratelimit.backoff` / `quota.cooldown_fallback` | Provider throttling or subscription rolling-window cooldown | Gateway, Dashboard |
+| `ratelimit.backoff` | Provider API throttling / retry backoff | Gateway, Dashboard |
 
 ---
 
@@ -851,7 +873,7 @@ A downstream lead can file a **change request** against an upstream contract dur
 
 ### 9.3 Contract-first parallelism and the join barrier (`A7-8`)
 1. The backend and frontend tasks for a feature run in parallel. For G1–G2 component tests, the frontend tests isolated component rendering, form validation, and error states against **static contract fixtures** backing the generated TypeScript API client (`frontend/src/api/generated/`), validating **both** outbound requests and mock fixture responses against the locked OpenAPI contract. *(OpenAPI defines shapes, not RBAC/conflict state machines, so multi-step stateful UI flows are NOT mocked.)*
-2. When both reach VERIFIED, a **join barrier** fires: the supervisor creates a `kind='integration'` task that reserves **both** `backend/app/features/<f>/` and `frontend/src/features/<f>/`, connects the frontend to the **live FastAPI backend + `sbx_<task>` database**, and verifies full multi-step stateful UI + API behavior end to end.
+2. When both reach **MERGED** (so both feature branches are on `main` and their write reservations have been released), a **join barrier** fires (`A8-1`): the supervisor creates a `kind='integration'` task branching fresh from `main` that reserves **both** `backend/app/features/<f>/` and `frontend/src/features/<f>/`, connects the frontend to the **live FastAPI backend + `sbx_<task>` database**, and verifies full multi-step stateful UI + API behavior end to end.
 3. Agents can ask each other questions through `threads` (`kind='agent_dm'`).
 
 ### 9.4 Contract change protocol (classification, batching, caps)
@@ -975,7 +997,7 @@ COMMIT;
 | `backend/app/main.py` | **Auto-discovery** of `features/*/router.py`; never edited after Wave 1 |
 | Frontend routing + navigation | Each feature exports `feature.ts` (`routes`, `navItems`, `guards`). The **`AppLayout`** (from F4) loads all of them via `import.meta.glob('../features/*/feature.ts')` |
 | SQLAlchemy models (`backend/app/models/`) + migrations | **Single writer + strict `MERGED` chaining:** only `kind='schema'` tasks (Data implementer, cheap model) hold these paths, and the supervisor runs them as serialized barriers (`blocks` dependency until `MERGED`, preventing Alembic two-head conflicts). Whenever a schema task merges in G5, the daemon refreshes `app_template` safely (`pg_terminate_backend` + `alembic upgrade head` under a Postgres advisory lock — `A7-9`). |
-| `pyproject.toml`, `package.json`, lockfiles | **Planned** dependencies are installed in Wave 1 (F1). **Unplanned (`install_package`, `A7-10`):** gated strictly by a **curated allowlist OR hard human `Approve`** (never `Notify`/`Auto`, regardless of preset). Enforces `--only-binary :all:` (`uv`) and `--ignore-scripts` (`pnpm`) to block malicious `setup.py` / `postinstall` execution, injects `HTTP(S)_PROXY` strictly into that single `docker exec` call, and records approved packages in `tasks.pending_deps` for deterministic lockfile application in the Merge Queue. |
+| `pyproject.toml`, `package.json`, lockfiles | **Planned** dependencies are installed in Wave 1 (F1). **Unplanned (`install_package`, `A7-10`, `A8-2`):** gated strictly by a **curated allowlist OR hard human `Approve`** (never `Notify`/`Auto`, regardless of preset). Enforces `--only-binary :all:` (`uv`) and `--ignore-scripts` (`pnpm`) installing ephemerally into writable container-only Docker volumes (`/opt/venv` and `/workspace/frontend/node_modules`) so rootfs stays read-only and host `workspaces/<task_id>` stays symlink-free, injects `HTTP(S)_PROXY` strictly into that single `docker exec` call, and records approved packages in `tasks.pending_deps` for deterministic lockfile application in the Merge Queue. |
 | Generated TS client (`frontend/src/api/generated/`) | Regenerated from the contract by the pipeline; never hand-edited |
 | `conftest.py` test fixtures | Created in F3 (Backend Lead's domain, including contract-defined `seed_user(role=...)` helper); readable by everyone; changes only by request |
 | `.env.example`, CI workflows, `.git*` files | Infra domain only; `.gitattributes`/`.gitmodules` and symlink entries (`mode 120000`) are always rejected for non-infra tasks |
@@ -983,7 +1005,7 @@ COMMIT;
 ### Layer 4: Enforcement + serial merge queue
 **Diff & symlink enforcement (`A7-3`, closes the `run_command` and symlink-exfiltration loopholes):**
 - `write_file` checks the reservation immediately (fast feedback).
-- **Pre-sync / pre-scan safety walk:** before syncing `workspaces/<task_id>` back into `worktrees/<task_id>` or running *any* host daemon tool (`git-mcp`, `Semgrep`, `gitleaks`, `oasdiff`), the daemon runs a deterministic recursive walk that **rejects any symlink (`os.path.islink` / git mode `120000`), FIFO/device node, or oversized YAML bomb**.
+- **Pre-sync / pre-scan safety walk (`A8-2`):** `/opt/venv` lives outside `/workspace` in a container-only Docker volume, and `/workspace/frontend/node_modules` is mounted over an empty directory excluded from host sync, so `pnpm`/`.venv` symlinks never materialize on host `workspaces/<task_id>`. Before syncing `workspaces/<task_id>` back into `worktrees/<task_id>` or running *any* host daemon tool (`git-mcp`, `Semgrep`, `gitleaks`, `oasdiff`), the daemon runs a deterministic recursive walk that **rejects any symlink (`os.path.islink` / git mode `120000`), FIFO/device node, or oversized YAML bomb**.
 - **At commit** (`git-mcp`, daemon-side): every path in `git status --porcelain` must fall within the task's reserved write set and contain zero mode `120000` entries. Otherwise the commit is rejected with the list of offending paths.
 - **At G2 and G5:** `git diff --name-only <base_sha>...HEAD` is re-checked.
 - Formatters and linters with `--fix` are run by `sandbox-mcp` **scoped to the write-set paths only**.
@@ -998,9 +1020,9 @@ COMMIT;
    *(Note: AST-aware **Mergiraf** is deferred to the Post-MIV Backlog — `A7-12` — and plugged in before the Integration Agent only if empirical merge conflict telemetry warrants it.)*
 4. Symlink/write-set diff check again; `squawk` migration lint (if migrations changed).
 5. **Full test suite on the combined code** (inside Docker, using the acquired heavy-exec slot). This catches semantic conflicts: changes that each work alone but break together.
-6. Fast-forward `main` → if `kind='schema'`, refresh `app_template` safely (`pg_advisory_lock` → `pg_terminate_backend` on lingering sessions → `ALLOW_CONNECTIONS = true` → `alembic upgrade head` → `ALLOW_CONNECTIONS = false`, plus matching cleanup on daemon startup — `A7-9`) → emit `main.updated` → incremental re-index.
+6. Fast-forward `main` → if `kind='schema'`, refresh `app_template` safely (`pg_advisory_lock` → `pg_terminate_backend` on lingering sessions → `ALLOW_CONNECTIONS = true` → `alembic upgrade head` → `pg_terminate_backend` again to clear Alembic sessions → `ALLOW_CONNECTIONS = false`, plus matching cleanup on daemon startup — `A7-9`, `A8-5`) → emit `main.updated` → incremental re-index. *(Any sandbox DB re-clone or teardown uses `DROP DATABASE IF EXISTS sbx_<task> WITH (FORCE)`.)*
 
-**No live rebasing (with clean recovery on schema-barrier merges — `A7-9`).** `main.updated` is **buffered** in the thread's state; regular feature merges rebase in the merge queue. When a `kind='schema'` barrier task merges, any dependent feature task rebases onto the new `main` SHA at its next clean loop boundary and re-clones `sbx_<task>` from `app_template`. If that boundary rebase hits a merge conflict or broken imports, the supervisor cleanly **discards the attempt's WIP branch, increments `attempt`, and restarts the task cleanly from the new `main` SHA** rather than leaving the thread in an undefined state.
+**No live rebasing (with clean recovery on schema-barrier merges — `A7-9`, `A8-5`).** `main.updated` is **buffered** in the thread's state; regular feature merges rebase in the merge queue. When a `kind='schema'` barrier task merges, any dependent feature task rebases onto the new `main` SHA at its next clean loop boundary and re-clones `sbx_<task>` (`DROP DATABASE IF EXISTS sbx_<task> WITH (FORCE)` + `CREATE DATABASE ... TEMPLATE app_template`). If that boundary rebase hits a merge conflict or broken imports, the supervisor cleanly **discards the attempt's WIP branch, increments `attempt`, and restarts the task cleanly from the new `main` SHA** rather than leaving the thread in an undefined state.
 
 ### Layer 5: Contract boundaries with automatic checks
 Domains interact only through contracts and generated clients. Conformance is **checked, not assumed**:
@@ -1016,8 +1038,8 @@ Domains interact only through contracts and generated clients. Conformance is **
 | Gate | When | Checks | Blocking? | Cost |
 |---|---|---|---|---|
 | **G1: Self-check** | Inside the implementer loop | Acquires 1 heavy-exec slot; **sequential execution** inside Docker (`ruff` → `mypy` → `pytest` + export `openapi.json` / `tsc` → `vitest`) **scoped to the write set**; quick `oasdiff` on static `openapi.json`; bounded Schemathesis (advisory here) | Loops back to the agent | Free |
-| **G2: Task gate** | → IN_REVIEW | **Symlink/FIFO walk + write-set diff check**; **sequential sandbox checks** (`ruff` → `mypy` → `pytest` + coverage → export `openapi.json` → **bounded Schemathesis** (`--hypothesis-seed=42 --max-examples=10`) / `tsc` → `vitest` + test-ID check); **daemon-side static checks** on the symlink-verified, read-only worktree (**`oasdiff` on static `openapi.json` (blocking)**, `Semgrep --max-memory 512 --jobs 1`, `gitleaks`) | Yes | Free |
-| **G3: Black-box tests** | Per feature, once the feature's tasks pass G2 | Test-Writer writes black-box API tests (and static-fixture component tests) from contracts; **post-test `Test-Validator`**; Dispute Protocol | Yes | `@verifier` |
+| **G2: Task gate** | → IN_REVIEW | **Acquires 1 heavy-exec slot** (covering sequential sandbox checks + host `Semgrep`); **Symlink/FIFO walk + write-set diff check**; **sequential sandbox checks** (`ruff` → `mypy` → `pytest` + coverage → export `openapi.json` → **bounded Schemathesis** (`--hypothesis-seed=42 --max-examples=10`) / `tsc` → `vitest` + test-ID check); **daemon-side static checks** on the symlink-verified, read-only worktree (**`oasdiff` on static `openapi.json` (blocking)**, `Semgrep --max-memory 512 --jobs 1`, `gitleaks`) | Yes | Free |
+| **G3: Black-box tests** | Per feature, once the feature's tasks pass G2 | **Acquires 1 heavy-exec slot** for test runs; Test-Writer writes black-box API tests (run in an isolated sandbox synced from the backend task's `IN_REVIEW` workspace) and static-fixture component tests (against the frontend task's `IN_REVIEW` workspace) strictly under declared test paths; **post-test `Test-Validator`**; Dispute Protocol; daemon validates (symlink walk + test-path allowlist) and commits passing G3 tests onto the task branch before transitioning to `VERIFIED` | Yes | `@verifier` |
 | **G4: Review** | Risk-based (auth/security, shared code, migrations, >300 changed lines, or a 25% sample) | Logic, edge cases, security, contract intent | Yes (when run) | `@verifier` |
 | **G5: Integration** | Serial merge queue | Acquires 1 heavy-exec slot (**priority over G3/G2/G1**); deps applied, rebase, symlink + diff check, **`squawk` migration lint + up/down test + crash-safe `app_template` refresh (if schema task)**, full suite on combined code, `oasdiff` on static `openapi.json` | Yes | Free |
 | **G6: Release** | Before deploy / promotion | Deploy to local blue/green (or Post-MIV staging), expand migrations, **Playwright E2E** (one browser) covering stateful multi-step UI journeys, acceptance criteria, then human approval decision | Yes | Free + human |
@@ -1044,7 +1066,7 @@ Test-Writer self-fix attempts are capped at 2 per round.
 ### 11.3 Principles
 - Automated checks always run **before** LLM-based checks.
 - The author of the code **never** writes the black-box tests.
-- Verifiers use a **different model family** when the budget/subscriptions allow (`require_verifier_family_diversity`).
+- Verifiers use a **different model family** when the budget and configured providers allow (`require_verifier_family_diversity`).
 - Every gate records **what it caught**, which feeds the metrics and ablations.
 
 ---
@@ -1128,10 +1150,10 @@ class DeployTarget(Protocol):
 | Implementation | Use |
 |---|---|
 | `LocalComposeTarget` | **Development + benchmark.** Blue/green: the new color starts on another port → 60 s probe + Playwright smoke → Caddy switches traffic → old color stopped. Rollback = switch back. No cloud, no cold starts, deterministic. |
-| `VercelRenderNeonTarget` | Stage A |
-| `AwsTarget`, `AzureTarget` | Stage B (Terraform) |
+| `VercelRenderNeonTarget` | Stage A (Post-MIV, P8) |
+| `AwsTarget`, `AzureTarget` | Stage B (Terraform — Post-MIV, P10) |
 
-### 13.2 Stage A: Vercel + Render + Neon (designed around free-tier limits)
+### 13.2 Stage A (Post-MIV): Vercel + Render + Neon (designed around free-tier limits)
 | Part | Service | Limits handled |
 |---|---|---|
 | Frontend | **Vercel** (Hobby): preview per branch + production | Non-commercial use only; fine for portfolio work |
@@ -1176,7 +1198,7 @@ Enforcement:
 ```
 Benchmark and local development use the same pipeline with `LocalComposeTarget` (steps 4–9 run locally, and approval is auto-granted in the benchmark preset).
 
-### 13.5 Stage B: AWS / Azure (Terraform)
+### 13.5 Stage B (Post-MIV): AWS / Azure (Terraform)
 | | AWS | Azure |
 |---|---|---|
 | Backend | App Runner or ECS Fargate | Container Apps |
@@ -1192,7 +1214,7 @@ Probe failures, health alerts, and E2E failures create `incidents`. Ownership co
 
 ---
 
-## 14. Infrastructure as code (Terraform + infra-mcp)
+## 14. Infrastructure as code (Terraform + infra-mcp) (Post-MIV)
 
 | MCP server | Purpose |
 |---|---|
@@ -1235,7 +1257,7 @@ Agent tools are MCP servers loaded into LangGraph via `langchain-mcp-adapters`.
 | Orchestrator | full | – | read | read | read | read | – | ✓ |
 | Leads | own domain + change approvals | read | read | read | – | plan (Infra Lead) | – | ✓ |
 | Implementer | task scope | own sandbox | commit own worktree | – | – | validate (Infra impl.) | – | ✓ |
-| Test-Writer | spec + contracts + `conftest.py` | own sandbox, **test paths only** | – | – | – | – | – | ✓ |
+| Test-Writer | spec + contracts + `conftest.py` | own sandbox, **test paths only** | – (daemon commits passing G3 tests onto the task branch) | – | – | – | – | ✓ |
 | Reviewer | task scope | – | read | – | – | – | – | ✓ |
 | Integration Agent | task scope | ✓ | merge-queue branch | – | – | – | – | ✓ |
 | Release Agent | read + incidents | – | read | full | full | apply (approved) | ✓ | – |
@@ -1592,10 +1614,10 @@ budgets:
 ### 19.1 Controls (including daemon supply-chain hardening — `A7-1`, `A7-3`, `A7-4`, `A7-10`)
 | Risk | Control |
 |---|---|
-| **Daemon supply-chain compromise (`A7-1`)** | **Zero LiteLLM** (only 3 official first-party SDKs: `openai`, `google-genai`, `anthropic`). Commit hash-verified `uv.lock`, enforce `uv sync --frozen` (and `--require-hashes` in CI/builds), apply a **3–7 day minimum PyPI release-age cooldown** (`exclude-newer` in `uv` config), and **pin every Docker image by immutable `sha256` digest** (never `:latest`). |
-| Harmful commands | Sandbox: non-root, `cap-drop ALL`, `no-new-privileges`, read-only root filesystem, pids/memory/CPU limits, command allowlist |
-| **Host-side code execution & symlink exfiltration (`A7-3`)** | Export `openapi.json` **strictly inside Docker** (never import agent code on the host). Before *any* host daemon tool (`git-mcp`, `Semgrep`, `gitleaks`, `oasdiff`) touches a workspace/worktree, run a deterministic recursive walk rejecting **any symlink (`os.path.islink` / git mode `120000`), FIFO/device node, or oversized YAML bomb**. |
-| Data theft / DNS tunneling / install scripts (`A7-3`, `A7-10`) | Sandbox on a dedicated **internal Docker network (`internal: true`, no external egress and no external DNS resolution)**. Blackboard DB and host daemon are unreachable from the sandbox (`REVOKE CONNECT ON DATABASE foundry_blackboard FROM PUBLIC`). Unplanned `install_package` requires **curated allowlist OR hard human `Approve`**, enforces `--only-binary :all:` (`uv`) and `--ignore-scripts` (`pnpm`), and injects `HTTP(S)_PROXY` strictly into that single `docker exec` call. |
+| **Daemon supply-chain compromise (`A7-1`, `A8-5`)** | **Zero LiteLLM** (only 3 official first-party SDKs: `openai`, `google-genai`, `anthropic`). Commit hash-verified `uv.lock`, enforce `uv sync --frozen` (automatically verifies `uv.lock` SHA-256 hashes; `--require-hashes` applies only to `uv pip install -r`), apply a **3–7 day minimum PyPI release-age cooldown** (`exclude-newer` in `uv` config), and **pin every Docker image by immutable `sha256` digest** (never `:latest`). |
+| Harmful commands | Sandbox: non-root, `cap-drop ALL`, `no-new-privileges`, read-only root filesystem + writable container-only volumes (`/opt/venv`, `/workspace/frontend/node_modules`) + tmpfs `/tmp`, pids/memory/CPU limits, command allowlist |
+| **Host-side code execution & symlink exfiltration (`A7-3`, `A8-2`)** | Export `openapi.json` **strictly inside Docker** (never import agent code on the host). `/opt/venv` and `/workspace/frontend/node_modules` live strictly inside container-only volumes (excluded from host sync). Before *any* host daemon tool (`git-mcp`, `Semgrep`, `gitleaks`, `oasdiff`) touches a workspace/worktree, run a deterministic recursive walk rejecting **any symlink (`os.path.islink` / git mode `120000`), FIFO/device node, or oversized YAML bomb**. |
+| Data theft / DNS tunneling / install scripts (`A7-3`, `A7-10`, `A8-5`) | Sandbox on a dedicated **internal Docker network (`internal: true`, no external egress and no external DNS resolution)**. Host daemon is network-unreachable from the sandbox; shared Postgres is accessible only for `sbx_<task>`, with `foundry_blackboard` isolated via per-task unprivileged roles (`role_sbx_<task>`) and `REVOKE CONNECT ON DATABASE foundry_blackboard FROM PUBLIC`. Unplanned `install_package` requires **curated allowlist OR hard human `Approve`**, enforces `--only-binary :all:` (`uv`) and `--ignore-scripts` (`pnpm`), and injects `HTTP(S)_PROXY` strictly into that single `docker exec` call. |
 | Sandbox escape via Docker | **The Docker socket is never mounted.** No privileged containers. Sandboxes are managed only by the daemon. |
 | Writes outside the worktree | Path jail in `sandbox-mcp` (normalized paths, symlinks rejected, everything under `/workspace`); write-set diff enforcement at commit, G2, and G5 |
 | Git hooks / config running on the host (`A7-4`) | Agents **never run git**. The container mounts a **`.git`-free workspace** (`workspaces/<task_id>`), so `/workspace/.git` does not exist inside Docker and the repo `.git` dir is never mounted. Daemon-side git runs only after symlink checks with `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, `GIT_CONFIG_NOSYSTEM=1`, and explicit `safe.directory`. Non-infra changes to `.gitattributes`, `.gitmodules`, `.git*`, and mode `120000` entries are rejected. |
@@ -1692,7 +1714,7 @@ server:
   port: 4200
 
 runtime:
-  max_heavy_exec_slots: 2           # semaphore for pytest/mypy/tsc/vitest/Schemathesis/G5 (A7-6)
+  max_heavy_exec_slots: 2           # semaphore for G1/G2 (incl. Semgrep), G3 test runs, and G5 merge queue (A7-6, A8-3)
   max_concurrent_tasks: 4           # lightweight agent containers allowed to wait on LLM I/O
   sandbox_limits:
     memory: 1536m
@@ -1828,7 +1850,7 @@ Because LLM runs have high variance (and 4 specs × 3 runs yields wide CIs), **e
 | Area | Choice |
 |---|---|
 | Language | Python 3.12 (daemon inside WSL2), TypeScript (dashboard + generated frontends) |
-| Package manager & supply chain (`A7-1`) | `uv` (Python: hash-verified `uv.lock`, `uv sync --frozen --require-hashes`, 3–7 day `exclude-newer` cooldown), `pnpm` (JS: `--ignore-scripts`) |
+| Package manager & supply chain (`A7-1`, `A8-5`) | `uv` (Python: hash-verified `uv.lock`, `uv sync --frozen` (verifies `uv.lock` hashes automatically; `--require-hashes` only for `uv pip`), 3–7 day `exclude-newer` cooldown), `pnpm` (JS: `--ignore-scripts`) |
 | Agent framework | **LangGraph** + `langgraph-checkpoint-postgres` + `langchain-mcp-adapters` |
 | LLM gateway (`A7-1`) | **Zero-LiteLLM First-Party SDK Gateway**: `openai` (`OpenAICompatibleTransport`), `google-genai` (`GoogleGenAITransport`), `anthropic` (`AnthropicTransport`) + rate-limit router + secret-scanner + normalized cassettes |
 | API server | FastAPI + WebSockets (`?after_seq=`) + Pydantic v2 |
@@ -1963,7 +1985,7 @@ Every feature deliberately skipped in v1.4 to keep MIV lean, fast, and reliable 
 
 | Risk | Mitigation |
 |---|---|
-| **Supply-chain compromise in gateway dependencies (`A7-1`)** | **Zero LiteLLM**; only 3 thin first-party SDKs (`openai`, `google-genai`, `anthropic`), hash-verified `uv.lock` (`--frozen`/`--require-hashes`), 3–7 day `exclude-newer` PyPI cooldown, and `sha256`-pinned Docker images |
+| **Supply-chain compromise in gateway dependencies (`A7-1`, `A8-5`)** | **Zero LiteLLM**; only 3 thin first-party SDKs (`openai`, `google-genai`, `anthropic`), hash-verified `uv.lock` (`uv sync --frozen`), 3–7 day `exclude-newer` PyPI cooldown, and `sha256`-pinned Docker images |
 | **Account / ToS suspension (`A7-2`)** | **Zero OAuth token scraping and zero automated CLI subscription loops**: official developer API keys + local Ollama/vLLM only |
 | **Host-side code execution & symlink exfiltration (`A7-3`)** | Export `openapi.json` strictly inside Docker; deterministic symlink/FIFO/mode-`120000`/YAML-bomb pre-walk before any host tool reads a worktree; `.git`-free container workspaces; internal no-DNS network; `REVOKE CONNECT` on blackboard DB |
 | **API budget exhaustion & runaway loops (`A7-11`)** | Normalized \$0 record/replay for all engine dev, native prefix caching, reconciled partitioned sub-budgets, hard 90-min wall-clock + 600-call kill-switch, Flash-Lite default with retry upgrade |
@@ -2041,7 +2063,7 @@ If you ever decide to monetize Foundry as a **hosted SaaS**:
 
 ---
 
-## Appendix A: Architecture Review Resolutions (v1.0 → v1.4)
+## Appendix A: Architecture Review Resolutions (v1.0 → v1.4.1)
 
 Every issue raised across all review passes (v1.1 through v1.4) is accounted for below:
 
@@ -2076,7 +2098,7 @@ Every issue raised across all review passes (v1.1 through v1.4) is accounted for
 | **A4-19:** Positioning claims vs MetaGPT, ChatDev, Replit Agent, Lovable | **Accepted** | Rewrote Section 1 positioning to credit existing tools and focus claims on formal conflict control, machine-checked contracts, cross-family black-box verification, and equal-cost ablations. | 1 |
 | **A5-1 / A5-3 (v1.2):** Universal provider support & 4-module progressive architecture | **Accepted (Superseded in part by `A7-1`)** | Organized repo around plug-and-play `Protocol` boundaries and 4 progressive modules (M1–M4). Universal API coverage retained via 3 first-party SDKs instead of LiteLLM (`A7-1`). | 2, 3, 16, 25, 26 |
 | **A6-1 – A6-9 (v1.3):** Initial runtime hardening pass | **Superseded / Refined by `A7-1` – `A7-12`** | Retained task-scoped heartbeats, sequential sandbox execution, schema chaining, `install_package` script disabling, and `openapi.yaml` request validation; refined/replaced `cli_bridge` loops (`A7-2`), pre-assertion validator (`A7-7`), stateful MSW (`A7-8`), schema rebase recovery (`A7-9`), `Notify+Undo` (`A7-11`), and host scanner isolation (`A7-3`). | See `A7-1`–`A7-13` |
-| **A7-1 (v1.4):** Remove LiteLLM after 2026 PyPI/Docker supply-chain compromises (`v1.82.7`/`v1.82.8`, `v1.107.0`) + add daemon supply-chain guardrails | **Accepted** | Removed `litellm` completely (~200 MB RAM saved, zero proxy blast radius); replaced with 3 thin first-party official SDK transports (`openai_compat` via `openai`, `google_genai` via `google-genai`, `anthropic` via `anthropic`); enforced hash-verified `uv.lock` (`--frozen`/`--require-hashes`), 3–7 day PyPI `exclude-newer` cooldown, and `sha256`-pinned Docker images. | 1, 2, 3, 4, 5, 8.2, 16, 18, 19.1, 24, 25, 26, 27, 28 |
+| **A7-1 (v1.4):** Remove LiteLLM after 2026 PyPI/Docker supply-chain compromises (`v1.82.7`/`v1.82.8`, `v1.107.0`) + add daemon supply-chain guardrails | **Accepted** | Removed `litellm` completely (~200 MB RAM saved, zero proxy blast radius); replaced with 3 thin first-party official SDK transports (`openai_compat` via `openai`, `google_genai` via `google-genai`, `anthropic` via `anthropic`); enforced hash-verified `uv.lock` (`uv sync --frozen`), 3–7 day PyPI `exclude-newer` cooldown, and `sha256`-pinned Docker images. | 1, 2, 3, 4, 5, 8.2, 16, 18, 19.1, 24, 25, 26, 27, 28 |
 | **A7-2 (v1.4):** `"100% ToS-compliant CLI bridge"` claim & ReAct `cli_bridge` latency/prompt fights | **Accepted** | Removed `"100% ToS-compliant"` claim and dropped `cli_bridge` from multi-step ReAct loops and benchmarks (Anthropic & Google actively restrict consumer OAuth in third-party harnesses; cold CLI boots destroy prefix caching and `--sandbox read-only` allows host reads). Defaulted strictly to official first-party API keys + local Ollama/vLLM; kept `ModelTransport` pluggable for any future opt-in single-shot adapter. | 1, 2, 3, 4, 5, 16.3, 16.7, 18, 26.2, 27 |
 | **A7-3 (v1.4):** Host-side `openapi.json` code execution, symlink (`mode 120000`) exfiltration, DNS tunneling & DB isolation | **Accepted** | Export `openapi.json` strictly inside Docker as a static artifact before host-side `oasdiff`; run deterministic recursive symlink/FIFO/mode-`120000`/YAML-bomb pre-walk before *any* host daemon tool (`git-mcp`, `Semgrep`, `gitleaks`, `oasdiff`) reads a workspace/worktree; disable external DNS on internal sandbox network; isolate blackboard DB (`REVOKE CONNECT … FROM PUBLIC`). | 4, 5.4, 7.5, 10 (L4–L5), 11.1, 15, 19.1, 27 |
 | **A7-4 (v1.4):** `/dev/null` bind-mount over `.git` breaks `hatchling`/`pytest`/`ruff`/`vite` | **Accepted** | Replaced `/dev/null` masking with a **`.git`-free container workspace** (`workspaces/<task_id>`) synced to/from daemon-owned `worktrees/<task_id>` after symlink validation so `/workspace/.git` does not exist inside Docker. | 5.4, 5.6, 10 (L2), 15, 19.1, 25 |
@@ -2089,3 +2111,8 @@ Every issue raised across all review passes (v1.1 through v1.4) is accounted for
 | **A7-11 (v1.4):** Reconciled budget caps, per-run kill-switches, simplified `Auto`/`Approve` decisions & CLI Decision Inbox | **Accepted** | Reconciled caps (`implement_usd: 0.60`, `review_usd: 0.15`, `blackbox_tests_usd: 0.30`); added 90-min wall-clock + 600-call run kill-switch; simplified v1 decisions to `Auto` vs `Approve`/`Human` (deferring `Notify+Undo` to Post-MIV) and added a **CLI Decision Inbox** in Module 2. | 9.8, 17.2–17.4, 18.4, 21.1, 22, 26.2 |
 | **A7-12 (v1.4):** Lean MIV scope & explicit Deferred Post-MIV Backlog | **Accepted** | Kept MIV laser-focused on core thesis (Modules 1–4: static feature write sets + serial merge queue + `LocalComposeTarget` + held-out benchmark); moved Stage A Vercel/Render/Neon, Mergiraf, mid-task write-set expansion, 5-min pause preemption, Redis Streams, `Notify+Undo`, and Stage B Terraform into the explicit plug-in backlog (**Section 26.2**). | 2, 10, 26.1, 26.2 |
 | **A7-13 (v1.4):** Benchmark rigor (dev vs held-out split, pinned API telemetry, equal `B1` scaffolding, paired bootstrap CIs) | **Accepted** | Split Dev specs (`S1–S2`) from Held-Out Core specs (`S3–S6`); enforced `benchmark_pin_models: true` on first-party APIs (exact token telemetry, zero fallback swaps); gave `B1` identical Wave 0 skeleton, pinned stubs, `oasdiff`/`Schemathesis`, and compaction; computed 95% **paired bootstrap CIs by spec**. | 3, 16.5, 23.3–23.6, 26.1, 28 |
+| **A8-1 (v1.4.1):** Join barrier at `VERIFIED` deadlocks with reservations held until `MERGED`, plus unspecified G3 workspace & commit path | **Accepted** | Moved the `kind='integration'` join barrier trigger from `VERIFIED` to **`MERGED`** (branching fresh from `main` once both feature write reservations are released). Specified that G3 runs black-box API tests in an isolated sandbox synced from the backend task's `IN_REVIEW` workspace (and static-fixture component tests against the frontend task's `IN_REVIEW` workspace), and that the **daemon** validates (symlink walk + test-path allowlist) and commits passing G3 tests onto the task branch before transitioning to `VERIFIED`. | 9.3, 11.1, 15 |
+| **A8-2 (v1.4.1):** `pnpm` `node_modules`/`.venv` symlinks conflict with `A7-3`'s symlink walk and `--read-only` rootfs blocks ephemeral package installs | **Accepted** | Mounted `/opt/venv` and `/workspace/frontend/node_modules` as **writable container-only Docker volumes** (seeded from image layers owned by uid `1000`, destroyed with the container, and excluded from host sync) so host `workspaces/<task_id>` stays 100% symlink-free while `uv pip install` / `pnpm add` and Vite/`tsc` resolution continue to work under `--read-only` rootfs. | 5.4, 10 (L3–L4), 19.1 |
+| **A8-3 (v1.4.1):** Concurrent heavy scans in G2/G3 can exceed RAM budget alongside G1/G5 | **Accepted** | Required both **G2** (sequential sandbox checks + host `Semgrep`) and **G3** black-box test runs to acquire 1 of the 2 `HeavyExecSemaphore` slots alongside G1 and G5. | 11.1, 22 |
+| **A8-4 (v1.4.1):** Postgres `UPDATE ... WHERE id IN (SELECT ... ORDER BY id)` does not guarantee `nextval` / `RETURNING` order | **Accepted** | Replaced the outbox relay query with an ordered CTE (`WITH ordered AS (SELECT id, nextval('events_publish_seq') AS seq FROM (SELECT id FROM events WHERE publish_seq IS NULL ORDER BY id LIMIT 500) s)`) joined on `e.id = o.id` plus defensive sorting of `published` by `publish_seq` in Python. | 8.3 |
+| **A8-5 (v1.4.1):** `uv sync --require-hashes` CLI flag error, Postgres privilege vs. network isolation wording, `app_template` post-migration cleanup, per-feature G3 DDL, `(Post-MIV)` headers, and stray deferred strings | **Accepted** | Fixed `uv sync --frozen` (verifies `uv.lock` hashes automatically; `--require-hashes` is `uv pip` only); clarified that shared Postgres is reachable on `5432` for `sbx_<task>` while `foundry_blackboard` is isolated via roles + `REVOKE CONNECT`; added post-migration `pg_terminate_backend` before `ALLOW_CONNECTIONS = false` and `DROP DATABASE ... WITH (FORCE)`; added `'verify'` to `tasks.kind` + `features` table; marked Sections 13.2, 13.5, and 14 as `(Post-MIV)`; and removed stale `Notify` / `writeset.expansion_*` / `quota.cooldown_fallback` / `subscriptions` text. | 1, TOC, 5.4, 7.4, 8.2, 8.4, 10 (L4), 11.3, 13.1–13.5, 14, 19.1, 24, 27, App A |
