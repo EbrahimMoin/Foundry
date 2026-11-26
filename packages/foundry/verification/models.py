@@ -1,9 +1,9 @@
-"""Pydantic models and feedback formatting for Foundry verification gates (G1/G2)."""
+"""Pydantic models and feedback formatting for Foundry verification gates (G1-G4)."""
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +13,8 @@ class GateName(StrEnum):
 
     G1 = "G1"
     G2 = "G2"
+    G3 = "G3"
+    G4 = "G4"
     G5 = "G5"
 
 
@@ -86,3 +88,83 @@ class GateReport(BaseModel):
             )
 
         return "\n".join(lines)
+
+
+class OutboundRequestTrace(BaseModel):
+    """Per-call outbound OpenAPI request-validation telemetry recorded by G3 `conftest.py`."""
+
+    test_nodeid: str = ""
+    method: str
+    path: str
+    status_code: int | None = None
+    request_valid: bool = True
+    expect_invalid: bool = False
+    validation_error: str | None = None
+    response_body_excerpt: str = ""
+
+
+TestValidationOutcome = Literal[
+    "passed",
+    "broken_test_code",
+    "invalid_test_request",
+    "assertion_failure",
+    "infra_failure",
+]
+
+
+class TestValidationResult(BaseModel):
+    """Deterministic post-test classification output from `Test-Validator` (`A7-7`)."""
+
+    outcome: TestValidationOutcome
+    route_to: Literal["none", "test_writer", "dispute", "infra"]
+    reason: str
+    failing_trace: OutboundRequestTrace | None = None
+    unknown_testids: list[str] = Field(default_factory=list)
+    detail: str = ""
+
+
+DisputeVerdict = Literal[
+    "test_wrong",
+    "code_wrong",
+    "contract_clarified",
+    "escalated_orchestrator",
+]
+
+
+class DisputeResolution(BaseModel):
+    """Outcome of the Section 9.7 Test Dispute Protocol."""
+
+    verdict: DisputeVerdict
+    step: Literal[1, 2, 3]
+    reason: str
+    clarified_rules: dict[str, Any] | None = None
+    dispute_round: int = 1
+
+
+class RiskAssessment(BaseModel):
+    """Result of evaluating Gate G4 risk-based review triggers."""
+
+    should_run: bool
+    reasons: list[str] = Field(default_factory=list)
+    sampled: bool = False
+    diff_lines: int = 0
+
+
+class G4Finding(BaseModel):
+    """Single review finding emitted by the cross-family G4 reviewer."""
+
+    severity: Literal["low", "medium", "high", "critical"]
+    path: str = ""
+    message: str
+
+
+class G4ReviewResult(BaseModel):
+    """Structured result of Gate G4 risk-based review."""
+
+    approved: bool
+    skipped: bool = False
+    risk: RiskAssessment
+    findings: list[G4Finding] = Field(default_factory=list)
+    summary: str = ""
+    cost_usd: float = 0.0
+    model_used: str = ""

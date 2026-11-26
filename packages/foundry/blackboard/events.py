@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +30,40 @@ class EventDispatcher:
     def __init__(self, repo: BlackboardRepository) -> None:
         self._repo = repo
         self._consumers: list[_ConsumerRegistration] = []
+        self._live_queues: dict[str, set[asyncio.Queue[BlackboardEvent]]] = {}
+
+    def subscribe_live(
+        self,
+        run_id: str,
+        *,
+        maxsize: int = 512,
+    ) -> asyncio.Queue[BlackboardEvent]:
+        """Register an ephemeral queue (e.g. WebSocket client) for committed run events."""
+        queue: asyncio.Queue[BlackboardEvent] = asyncio.Queue(maxsize=maxsize)
+        self._live_queues.setdefault(run_id, set()).add(queue)
+        return queue
+
+    def unsubscribe_live(
+        self,
+        run_id: str,
+        queue: asyncio.Queue[BlackboardEvent],
+    ) -> None:
+        """Unregister an ephemeral live queue on client disconnect."""
+        queues = self._live_queues.get(run_id)
+        if not queues:
+            return
+        queues.discard(queue)
+        if not queues:
+            self._live_queues.pop(run_id, None)
+
+    def _notify_live_queues(self, event: BlackboardEvent) -> None:
+        for key in (event.run_id, "*"):
+            for queue in list(self._live_queues.get(key, ())):
+                if queue.full():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(event)
 
     def subscribe(
         self,
@@ -58,6 +93,7 @@ class EventDispatcher:
             )
             if should_handle:
                 await consumer.handler(event)
+        self._notify_live_queues(event)
 
     async def replay_missed(
         self,

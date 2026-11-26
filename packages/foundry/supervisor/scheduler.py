@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from foundry.agents.graphs.verifier_graph import G3VerificationResult
 from foundry.blackboard.events import EventRelay
 from foundry.blackboard.models import TaskRecord, TaskStatus
 from foundry.blackboard.repository import BlackboardRepository
@@ -14,9 +15,12 @@ from foundry.concurrency.reservations import WriteReservationManager
 from foundry.contracts.protocol import ContractChangeProtocol
 from foundry.decisions.service import DecisionService
 from foundry.supervisor.waves import advance_ready_tasks
+from foundry.verification.models import G4ReviewResult
 
 ImplementerResultLike = Any
 ParallelWorkerFn = Callable[[TaskRecord, dict[str, Any]], Awaitable[ImplementerResultLike]]
+G3VerifierHook = Callable[[TaskRecord, dict[str, Any]], Awaitable[G3VerificationResult]]
+G4ReviewerHook = Callable[[TaskRecord, dict[str, Any]], Awaitable[G4ReviewResult]]
 
 
 async def _noop_parallel_worker(task: TaskRecord, context: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +41,8 @@ class ParallelWaveScheduler:
         contract_protocol: ContractChangeProtocol | None = None,
         decisions: DecisionService | None = None,
         worker_fn: ParallelWorkerFn | None = None,
+        g3_verifier: G3VerifierHook | None = None,
+        g4_reviewer: G4ReviewerHook | None = None,
         max_concurrent_tasks: int = 4,
         heartbeat_interval_s: float = 60.0,
     ) -> None:
@@ -47,6 +53,8 @@ class ParallelWaveScheduler:
         self._contract_protocol = contract_protocol
         self._decisions = decisions
         self._worker_fn = worker_fn or _noop_parallel_worker
+        self._g3_verifier = g3_verifier
+        self._g4_reviewer = g4_reviewer
         self.max_concurrent_tasks = max(1, max_concurrent_tasks)
         self.heartbeat_interval_s = heartbeat_interval_s
         self._schema_boundary_refs: dict[str, dict[str, str | None]] = {}
@@ -73,6 +81,7 @@ class ParallelWaveScheduler:
         run_id: str,
         task_id: str,
         result: Any,
+        contracts: dict[str, dict[str, Any]],
         merge_outcomes: list[MergeOutcome],
     ) -> None:
         self._schema_boundary_refs.pop(task_id, None)
@@ -84,6 +93,66 @@ class ParallelWaveScheduler:
                 latest = await self._repo.set_task_status(
                     latest.id, TaskStatus.IN_REVIEW, latest.version
                 )
+            verify_ctx = {
+                "contracts": contracts,
+                "worker_result": result,
+            }
+            if self._g3_verifier is not None and latest.status == TaskStatus.IN_REVIEW:
+                g3_res = await self._g3_verifier(latest, verify_ctx)
+                verify_ctx["g3_result"] = g3_res
+                if g3_res.status == "code_wrong":
+                    await self._reservations.release(run_id, latest.id, reason="released")
+                    if latest.attempt + 1 < latest.max_attempts:
+                        await self._repo.set_task_status(
+                            latest.id,
+                            TaskStatus.READY,
+                            latest.version,
+                            attempt=latest.attempt + 1,
+                            event_payload={"g3_code_wrong": True, "reason": g3_res.summary},
+                        )
+                    else:
+                        await self._repo.set_task_status(
+                            latest.id,
+                            TaskStatus.ESCALATED,
+                            latest.version,
+                            event_payload={"g3_escalated": True, "reason": g3_res.summary},
+                        )
+                    return
+                if g3_res.status != "verified":
+                    await self._reservations.release(run_id, latest.id, reason="released")
+                    await self._repo.set_task_status(
+                        latest.id,
+                        TaskStatus.ESCALATED,
+                        latest.version,
+                        event_payload={"g3_status": g3_res.status, "reason": g3_res.summary},
+                    )
+                    return
+
+            if self._g4_reviewer is not None and latest.status == TaskStatus.IN_REVIEW:
+                g4_res = await self._g4_reviewer(latest, verify_ctx)
+                if g4_res.cost_usd > 0.0:
+                    latest = await self._repo.increment_task_review_spend(
+                        latest.id, g4_res.cost_usd
+                    )
+                if not g4_res.approved:
+                    await self._reservations.release(run_id, latest.id, reason="released")
+                    if latest.attempt + 1 < latest.max_attempts:
+                        await self._repo.set_task_status(
+                            latest.id,
+                            TaskStatus.READY,
+                            latest.version,
+                            attempt=latest.attempt + 1,
+                            event_payload={"g4_rejected": True, "summary": g4_res.summary},
+                        )
+                    else:
+                        await self._repo.set_task_status(
+                            latest.id,
+                            TaskStatus.ESCALATED,
+                            latest.version,
+                            event_payload={"g4_escalated": True, "summary": g4_res.summary},
+                        )
+                    return
+
             if latest.status == TaskStatus.IN_REVIEW:
                 latest = await self._repo.set_task_status(
                     latest.id, TaskStatus.VERIFIED, latest.version
@@ -254,6 +323,7 @@ class ParallelWaveScheduler:
                             run_id=run_id,
                             task_id=tid,
                             result=res,
+                            contracts=contract_map,
                             merge_outcomes=merge_outcomes,
                         )
                     await self._relay.flush_once()

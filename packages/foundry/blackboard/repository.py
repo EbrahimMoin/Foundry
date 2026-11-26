@@ -234,6 +234,31 @@ def _to_feature_dto(row: FeatureRow) -> FeatureRecord:
     )
 
 
+def _to_llm_call_dto(row: LlmCallRow) -> LlmCallRecord:
+    return LlmCallRecord(
+        id=int(row.id),
+        run_id=row.run_id,
+        agent_id=row.agent_id,
+        task_id=row.task_id,
+        graph_thread_id=row.graph_thread_id,
+        node=row.node,
+        provider=row.provider,
+        model=row.model,
+        profile=row.profile,
+        transport=row.transport,
+        billing_mode=row.billing_mode,
+        input_tokens=int(row.input_tokens),
+        cached_tokens=int(row.cached_tokens),
+        output_tokens=int(row.output_tokens),
+        cost_usd=float(row.cost_usd),
+        est_value_usd=float(row.est_value_usd),
+        latency_ms=row.latency_ms,
+        replayed=bool(row.replayed),
+        prompt_hash=row.prompt_hash,
+        created_at=row.created_at,
+    )
+
+
 @runtime_checkable
 class BlackboardRepository(Protocol):
     """Typed storage + transactional outbox contract for Foundry Blackboard state."""
@@ -249,6 +274,8 @@ class BlackboardRepository(Protocol):
     ) -> RunRecord: ...
 
     async def get_run(self, run_id: str) -> RunRecord: ...
+
+    async def list_runs(self, project_id: str | None = None) -> list[RunRecord]: ...
 
     async def update_run_phase(
         self,
@@ -272,6 +299,10 @@ class BlackboardRepository(Protocol):
     ) -> AgentRecord: ...
 
     async def update_agent_status(self, agent_id: str, status: str) -> AgentRecord: ...
+
+    async def list_agents(self, run_id: str) -> list[AgentRecord]: ...
+
+    async def get_agent(self, agent_id: str) -> AgentRecord: ...
 
     async def create_task(
         self,
@@ -347,6 +378,8 @@ class BlackboardRepository(Protocol):
         parent_task_id: str | None = None,
     ) -> TaskRecord: ...
 
+    async def increment_task_review_spend(self, task_id: str, delta_usd: float) -> TaskRecord: ...
+
     async def acquire_write_reservations(
         self,
         run_id: str,
@@ -402,6 +435,8 @@ class BlackboardRepository(Protocol):
     async def list_contracts(self, run_id: str) -> list[ContractRecord]: ...
 
     async def get_latest_contract_version(self, contract_id: str) -> ContractVersionRecord: ...
+
+    async def list_contract_versions(self, contract_id: str) -> list[ContractVersionRecord]: ...
 
     async def lock_contract(
         self,
@@ -462,6 +497,8 @@ class BlackboardRepository(Protocol):
     ) -> FeatureRecord: ...
 
     async def list_features(self, run_id: str) -> list[FeatureRecord]: ...
+
+    async def get_feature(self, run_id: str, name: str) -> FeatureRecord | None: ...
 
     async def get_or_create_decision(
         self,
@@ -558,6 +595,8 @@ class BlackboardRepository(Protocol):
         prompt_hash: str | None = None,
     ) -> LlmCallRecord: ...
 
+    async def list_llm_calls(self, run_id: str) -> list[LlmCallRecord]: ...
+
     async def emit_event(
         self,
         *,
@@ -628,6 +667,15 @@ class PostgresBlackboardRepository:
                 raise NotFoundError(f"Run not found: {run_id}")
             return _to_run_dto(row)
 
+    async def list_runs(self, project_id: str | None = None) -> list[RunRecord]:
+        async with self._db.session_factory() as s:
+            stmt = select(RunRow)
+            if project_id is not None:
+                stmt = stmt.where(RunRow.project_id == project_id)
+            stmt = stmt.order_by(RunRow.started_at.desc(), RunRow.id.desc())
+            rows = (await s.scalars(stmt)).all()
+            return [_to_run_dto(r) for r in rows]
+
     async def update_run_phase(
         self,
         run_id: str,
@@ -691,6 +739,22 @@ class PostgresBlackboardRepository:
                 raise NotFoundError(f"Agent not found: {agent_id}")
             row.status = status
             await s.flush()
+            return _to_agent_dto(row)
+
+    async def list_agents(self, run_id: str) -> list[AgentRecord]:
+        async with self._db.session_factory() as s:
+            rows = (
+                await s.scalars(
+                    select(AgentRow).where(AgentRow.run_id == run_id).order_by(AgentRow.id)
+                )
+            ).all()
+            return [_to_agent_dto(r) for r in rows]
+
+    async def get_agent(self, agent_id: str) -> AgentRecord:
+        async with self._db.session_factory() as s:
+            row = await s.get(AgentRow, agent_id)
+            if row is None:
+                raise NotFoundError(f"Agent not found: {agent_id}")
             return _to_agent_dto(row)
 
     async def create_task(
@@ -950,6 +1014,20 @@ class PostgresBlackboardRepository:
             refreshed = await s.get(TaskRow, task_id)
             assert refreshed is not None
             return _to_task_dto(refreshed)
+
+    async def increment_task_review_spend(self, task_id: str, delta_usd: float) -> TaskRecord:
+        async with self._db.session_factory() as s, s.begin():
+            row = await s.get(TaskRow, task_id)
+            if row is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            row.spent_review_usd = float(row.spent_review_usd) + float(delta_usd)
+            row.updated_at = datetime.now(UTC)
+            run_row = await s.get(RunRow, row.run_id)
+            if run_row is not None:
+                run_row.spent_usd = float(run_row.spent_usd) + float(delta_usd)
+            await s.flush()
+            await s.refresh(row)
+            return _to_task_dto(row)
 
     async def acquire_write_reservations(
         self,
@@ -1232,6 +1310,20 @@ class PostgresBlackboardRepository:
                 raise NotFoundError(f"No versions for contract {contract_id}")
             return _to_cv_dto(ver_row)
 
+    async def list_contract_versions(self, contract_id: str) -> list[ContractVersionRecord]:
+        async with self._db.session_factory() as s:
+            contract = await s.get(ContractRow, contract_id)
+            if contract is None:
+                raise NotFoundError(f"Contract not found: {contract_id}")
+            rows = (
+                await s.scalars(
+                    select(ContractVersionRow)
+                    .where(ContractVersionRow.contract_id == contract_id)
+                    .order_by(ContractVersionRow.version)
+                )
+            ).all()
+            return [_to_cv_dto(r) for r in rows]
+
     async def lock_contract(
         self,
         contract_id: str,
@@ -1449,6 +1541,11 @@ class PostgresBlackboardRepository:
                 )
             ).all()
             return [_to_feature_dto(r) for r in rows]
+
+    async def get_feature(self, run_id: str, name: str) -> FeatureRecord | None:
+        async with self._db.session_factory() as s:
+            row = await s.get(FeatureRow, (run_id, name))
+            return _to_feature_dto(row) if row is not None else None
 
     async def get_or_create_decision(
         self,
@@ -1766,28 +1863,16 @@ class PostgresBlackboardRepository:
             s.add(row)
             await s.flush()
             await s.refresh(row)
-            return LlmCallRecord(
-                id=int(row.id),
-                run_id=row.run_id,
-                agent_id=row.agent_id,
-                task_id=row.task_id,
-                graph_thread_id=row.graph_thread_id,
-                node=row.node,
-                provider=row.provider,
-                model=row.model,
-                profile=row.profile,
-                transport=row.transport,
-                billing_mode=row.billing_mode,
-                input_tokens=int(row.input_tokens),
-                cached_tokens=int(row.cached_tokens),
-                output_tokens=int(row.output_tokens),
-                cost_usd=float(row.cost_usd),
-                est_value_usd=float(row.est_value_usd),
-                latency_ms=row.latency_ms,
-                replayed=bool(row.replayed),
-                prompt_hash=row.prompt_hash,
-                created_at=row.created_at,
-            )
+            return _to_llm_call_dto(row)
+
+    async def list_llm_calls(self, run_id: str) -> list[LlmCallRecord]:
+        async with self._db.session_factory() as s:
+            rows = (
+                await s.scalars(
+                    select(LlmCallRow).where(LlmCallRow.run_id == run_id).order_by(LlmCallRow.id)
+                )
+            ).all()
+            return [_to_llm_call_dto(r) for r in rows]
 
     async def emit_event(
         self,
@@ -1980,6 +2065,11 @@ class InMemoryBlackboardRepository:
             raise NotFoundError(f"Run not found: {run_id}")
         return self._runs[run_id]
 
+    async def list_runs(self, project_id: str | None = None) -> list[RunRecord]:
+        items = [r for r in self._runs.values() if project_id is None or r.project_id == project_id]
+        items.sort(key=lambda r: (r.started_at, r.id), reverse=True)
+        return items
+
     async def update_run_phase(
         self,
         run_id: str,
@@ -2044,6 +2134,17 @@ class InMemoryBlackboardRepository:
             self._agents[agent_id] = updated
             self._save_hook()
             return updated
+
+    async def list_agents(self, run_id: str) -> list[AgentRecord]:
+        items = [a for a in self._agents.values() if a.run_id == run_id]
+        items.sort(key=lambda a: a.id)
+        return items
+
+    async def get_agent(self, agent_id: str) -> AgentRecord:
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            raise NotFoundError(f"Agent not found: {agent_id}")
+        return agent
 
     async def create_task(
         self,
@@ -2253,6 +2354,26 @@ class InMemoryBlackboardRepository:
                 updates["parent_task_id"] = parent_task_id
             updated = cur.model_copy(update=updates)
             self._tasks[task_id] = updated
+            self._save_hook()
+            return updated
+
+    async def increment_task_review_spend(self, task_id: str, delta_usd: float) -> TaskRecord:
+        async with self._lock:
+            cur = self._tasks.get(task_id)
+            if cur is None:
+                raise NotFoundError(f"Task not found: {task_id}")
+            updated = cur.model_copy(
+                update={
+                    "spent_review_usd": cur.spent_review_usd + float(delta_usd),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._tasks[task_id] = updated
+            run = self._runs.get(cur.run_id)
+            if run is not None:
+                self._runs[cur.run_id] = run.model_copy(
+                    update={"spent_usd": run.spent_usd + float(delta_usd)}
+                )
             self._save_hook()
             return updated
 
@@ -2499,6 +2620,12 @@ class InMemoryBlackboardRepository:
             raise NotFoundError(f"No versions for contract {contract_id}")
         return self._contract_versions[key]
 
+    async def list_contract_versions(self, contract_id: str) -> list[ContractVersionRecord]:
+        await self.get_contract_by_id(contract_id)
+        items = [v for (cid, _), v in self._contract_versions.items() if cid == contract_id]
+        items.sort(key=lambda v: v.version)
+        return items
+
     async def lock_contract(
         self,
         contract_id: str,
@@ -2670,6 +2797,9 @@ class InMemoryBlackboardRepository:
         items = [f for (rid, _), f in self._features.items() if rid == run_id]
         items.sort(key=lambda f: f.name)
         return items
+
+    async def get_feature(self, run_id: str, name: str) -> FeatureRecord | None:
+        return self._features.get((run_id, name))
 
     async def get_or_create_decision(
         self,
@@ -2914,6 +3044,11 @@ class InMemoryBlackboardRepository:
             self._llm_calls.append(rec)
             self._save_hook()
             return rec
+
+    async def list_llm_calls(self, run_id: str) -> list[LlmCallRecord]:
+        items = [c for c in self._llm_calls if c.run_id == run_id]
+        items.sort(key=lambda c: c.id)
+        return items
 
     async def emit_event(
         self,

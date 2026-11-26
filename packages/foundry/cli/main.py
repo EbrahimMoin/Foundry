@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from foundry.agents.single import ReplayMockSandboxProvider, SingleAgentRunner
+from foundry.api import DaemonState, create_app
 from foundry.blackboard import (
     BlackboardDB,
     BlackboardRepository,
@@ -1124,3 +1125,51 @@ def run_resume(
 
     summary = asyncio.run(_run())
     _render_run_summary(summary)
+
+
+@app.command()
+def serve(
+    host: Annotated[str | None, typer.Option(help="Bind host (defaults to foundry.yaml)")] = None,
+    port: Annotated[int | None, typer.Option(help="Bind port (defaults to foundry.yaml)")] = None,
+    dsn: Annotated[str | None, typer.Option(help="Postgres DSN for Blackboard")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(help="Offline JSON Blackboard state file (skips Postgres)"),
+    ] = None,
+    config_dir: Annotated[Path, typer.Option()] = CONFIG_DIR_DEFAULT,
+    project_dir: Annotated[Path | None, typer.Option()] = None,
+    dashboard_dir: Annotated[
+        Path,
+        typer.Option(help="Built Dashboard v0.5 static dist directory"),
+    ] = Path("dashboard/dist"),
+) -> None:
+    """Serve the Foundry Daemon HTTP API, WebSocket stream, and Dashboard v0.5."""
+    import uvicorn
+
+    global_cfg = (
+        load_foundry_config(config_dir / "foundry.yaml")
+        if (config_dir / "foundry.yaml").exists()
+        else default_foundry_config()
+    )
+    bind_host = host or global_cfg.server.host
+    bind_port = port or global_cfg.server.port
+    resolved_project = project_dir or Path.cwd()
+    repo, _db = _open_blackboard(dsn, state_file)
+    dispatcher = EventDispatcher(repo)
+    relay = EventRelay(repo, dispatcher)
+    decisions = DecisionService(repo)
+    listen_dsn = resolve_dsn(dsn) if state_file is None else None
+    daemon_state = DaemonState(
+        repo=repo,
+        dispatcher=dispatcher,
+        relay=relay,
+        decisions=decisions,
+        config_dir=config_dir,
+        project_dir=resolved_project,
+        dashboard_dir=dashboard_dir if dashboard_dir.is_dir() else None,
+        listen_dsn=listen_dsn,
+        start_relay_in_lifespan=True,
+    )
+    fastapi_app = create_app(daemon_state)
+    console.print(f"[green]Foundry Daemon listening at[/green] http://{bind_host}:{bind_port}")
+    uvicorn.run(fastapi_app, host=bind_host, port=bind_port)

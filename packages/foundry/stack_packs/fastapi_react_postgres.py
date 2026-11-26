@@ -424,17 +424,25 @@ def downgrade() -> None:
     ${downgrades if downgrades else "pass"}
 """
 
-_CONFTEST_PY = '''"""Shared G3 & integration fixtures with OpenAPI request telemetry."""
+_CONFTEST_PY = r'''"""Shared G3 fixtures with post-test OpenAPI request telemetry (A7-7)."""
 
 from __future__ import annotations
 
+import json
+import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
 
 from app.main import app
+
+_TRACE_FILE = Path(".foundry_tmp/g3_request_trace.jsonl")
+_LOCKED_OPENAPI_FILE = Path(".foundry_tmp/locked_openapi.json")
 
 
 @dataclass
@@ -445,6 +453,7 @@ class RequestValidationRecord:
     expect_invalid: bool = False
     error: str | None = None
     status_code: int | None = None
+    test_nodeid: str = ""
 
 
 @dataclass
@@ -453,6 +462,217 @@ class RequestValidationRecorder:
 
     def record(self, item: RequestValidationRecord) -> None:
         self.records.append(item)
+
+
+def _load_openapi_spec() -> dict[str, Any]:
+    if _LOCKED_OPENAPI_FILE.is_file():
+        loaded = json.loads(_LOCKED_OPENAPI_FILE.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+    return app.openapi()
+
+
+def _resolve_ref(spec: dict[str, Any], schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {}
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        cur: Any = spec
+        for part in ref[2:].split("/"):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                return {}
+        if isinstance(cur, dict):
+            return cur
+    return schema
+
+
+def _match_operation(
+    spec: dict[str, Any], method: str, path: str
+) -> tuple[str, dict[str, Any]] | None:
+    paths = spec.get("paths") or {}
+    if not isinstance(paths, dict):
+        return None
+    m = method.lower()
+    if path in paths and isinstance(paths[path], dict) and m in paths[path]:
+        op = paths[path][m]
+        return (path, op) if isinstance(op, dict) else None
+    for tmpl, methods in paths.items():
+        if not isinstance(methods, dict) or m not in methods:
+            continue
+        seg_parts = [
+            "[^/]+" if seg.startswith("{") and seg.endswith("}") else re.escape(seg)
+            for seg in str(tmpl).strip("/").split("/")
+        ]
+        regex = "^/" + "/".join(seg_parts) + "$"
+        if str(tmpl) == "/":
+            regex = "^/$"
+        if re.match(regex, path):
+            op = methods[m]
+            if isinstance(op, dict):
+                return str(tmpl), op
+    return None
+
+
+def _check_type(value: Any, expected_type: str | None) -> bool:
+    if expected_type is None:
+        return True
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _validate_outbound_request(
+    spec: dict[str, Any],
+    *,
+    method: str,
+    url: str,
+    json_body: Any,
+    params: Any,
+) -> tuple[bool, str | None]:
+    parsed = urlsplit(str(url))
+    path = parsed.path or "/"
+    matched = _match_operation(spec, method, path)
+    if matched is None:
+        return False, f"Undocumented operation {method.upper()} {path}"
+
+    _, op = matched
+    # Query parameters
+    param_defs = op.get("parameters") or []
+    if isinstance(param_defs, list):
+        provided_params = dict(params) if isinstance(params, dict) else {}
+        if parsed.query:
+            for item in parsed.query.split("&"):
+                if "=" in item:
+                    k, _ = item.split("=", 1)
+                    provided_params.setdefault(k, "")
+        for pdef in param_defs:
+            if not isinstance(pdef, dict):
+                continue
+            if (
+                pdef.get("in") == "query"
+                and pdef.get("required")
+                and pdef.get("name") not in provided_params
+            ):
+                return False, f"Missing required query parameter '{pdef.get('name')}'"
+
+    # JSON Request Body
+    req_body = op.get("requestBody")
+    if isinstance(req_body, dict):
+        content = (req_body.get("content") or {}).get("application/json")
+        if req_body.get("required") and json_body is None and isinstance(content, dict):
+            return False, "Missing required JSON requestBody"
+        if json_body is not None and isinstance(content, dict):
+            schema = _resolve_ref(spec, content.get("schema"))
+            if isinstance(json_body, dict):
+                for req_field in schema.get("required") or []:
+                    if req_field not in json_body:
+                        return False, f"Missing required body field '{req_field}'"
+                props = schema.get("properties") or {}
+                if isinstance(props, dict):
+                    for key, val in json_body.items():
+                        if key in props and val is not None:
+                            prop_schema = _resolve_ref(spec, props[key])
+                            if not _check_type(val, prop_schema.get("type")):
+                                return (
+                                    False,
+                                    f"Field '{key}' expected type {prop_schema.get('type')}",
+                                )
+    return True, None
+
+
+class _InstrumentedAsyncClient(httpx.AsyncClient):
+    """AsyncClient that records per-call OpenAPI validation traces without short-circuiting."""
+
+    def __init__(
+        self,
+        *args: Any,
+        recorder: RequestValidationRecorder,
+        spec: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._recorder = recorder
+        self._spec = spec
+
+    async def request(self, method: str, url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
+        expect_invalid = bool(kwargs.pop("expect_invalid", False))
+        headers = dict(kwargs.get("headers") or {})
+        for hk in list(headers):
+            if hk.lower() == "x-foundry-expect-invalid":
+                expect_invalid = str(headers.pop(hk)).lower() in {"1", "true", "yes"}
+                kwargs["headers"] = headers
+
+        valid, error = _validate_outbound_request(
+            self._spec,
+            method=method,
+            url=str(url),
+            json_body=kwargs.get("json"),
+            params=kwargs.get("params"),
+        )
+        response = await super().request(method, url, *args, **kwargs)
+        nodeid = os.environ.get("PYTEST_CURRENT_TEST", "").split(" ", 1)[0]
+        path = urlsplit(str(url)).path or "/"
+        rec = RequestValidationRecord(
+            method=method.upper(),
+            path=path,
+            valid=valid,
+            expect_invalid=expect_invalid,
+            error=error,
+            status_code=response.status_code,
+            test_nodeid=nodeid,
+        )
+        self._recorder.record(rec)
+        _TRACE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "test_nodeid": nodeid,
+            "method": rec.method,
+            "path": path,
+            "status_code": response.status_code,
+            "request_valid": valid,
+            "expect_invalid": expect_invalid,
+            "validation_error": error,
+            "response_body_excerpt": response.text[:300],
+        }
+        with _TRACE_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
+        return response
+
+    async def get(
+        self, url: Any, *args: Any, expect_invalid: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        return await self.request("GET", url, *args, expect_invalid=expect_invalid, **kwargs)
+
+    async def post(
+        self, url: Any, *args: Any, expect_invalid: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        return await self.request("POST", url, *args, expect_invalid=expect_invalid, **kwargs)
+
+    async def put(
+        self, url: Any, *args: Any, expect_invalid: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        return await self.request("PUT", url, *args, expect_invalid=expect_invalid, **kwargs)
+
+    async def patch(
+        self, url: Any, *args: Any, expect_invalid: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        return await self.request("PATCH", url, *args, expect_invalid=expect_invalid, **kwargs)
+
+    async def delete(
+        self, url: Any, *args: Any, expect_invalid: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        return await self.request("DELETE", url, *args, expect_invalid=expect_invalid, **kwargs)
 
 
 @pytest.fixture
@@ -480,8 +700,14 @@ def auth_headers():
 
 @pytest.fixture
 async def client(validation_recorder: RequestValidationRecorder) -> Any:
+    spec = _load_openapi_spec()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+    async with _InstrumentedAsyncClient(
+        transport=transport,
+        base_url="http://test",
+        recorder=validation_recorder,
+        spec=spec,
+    ) as async_client:
         yield async_client
 '''
 

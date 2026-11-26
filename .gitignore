@@ -21,3 +21,8 @@ credentials.enc
 .foundry/workspaces/
 .foundry/logs/
 *.db
+
+# Dashboard Node dependencies (installed inside pinned node:22 container with --ignore-scripts)
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.pnpm-store/

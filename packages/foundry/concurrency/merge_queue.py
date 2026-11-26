@@ -298,7 +298,13 @@ class SerialMergeQueue:
                     detail=str(exc),
                 )
 
-            allowed_write_set = [*write_set, *extra_paths]
+            g3_test_paths: list[str] = []
+            if task.feature:
+                g3_test_paths = [
+                    f"backend/tests/blackbox/{task.feature}/",
+                    f"frontend/src/features/{task.feature}/__tests__/",
+                ]
+            allowed_write_set = [*write_set, *extra_paths, *g3_test_paths]
             if extra_paths:
                 pending_paths = await self._git.status_paths(worktree_dir)
                 if pending_paths:
