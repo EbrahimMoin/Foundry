@@ -1,15 +1,280 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+/*
+ * Warm Botanical Editorial Control Plane Palette
+ * Follows modern-web-guidance `dark-mode` and `dark-mode-toggle`:
+ * - Root base stays `color-scheme: light dark`
+ * - `<meta name="color-scheme">` is reflected back to CSS via :has(...)
+ * - Never transition or animate `scrollbar-color`
+ * - Legacy WebKit scrollbars sit strictly behind `@supports not (scrollbar-color: auto)`
+ */
+:root {
+  color-scheme: light dark;
+
+  --font-serif: "Newsreader", Georgia, "Times New Roman", serif;
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Light Theme — Warm Cream Parchment & Botanical Forest Sage */
+  --bg-canvas: #f8f3ec;
+  --bg-sidebar: #f2ece3;
+  --bg-surface: #fbf8f4;
+  --bg-elevated: #f4eee5;
+  --bg-recessed: #eee6db;
+  --bg-bubble: #ebe1d3;
+  --bg-hover: rgba(45, 38, 28, 0.055);
+  --bg-active: #e7ddd0;
+
+  --border-hairline: #e4dacd;
+  --border-strong: #d3c6b5;
+
+  --ink-primary: #1a211c;
+  --ink-secondary: #4c4a43;
+  --ink-muted: #847d72;
+
+  --accent: #1b6b46;
+  --accent-strong: #145436;
+  --accent-pill: #76aa8b;
+  --accent-soft: rgba(27, 107, 70, 0.10);
+  --accent-border: rgba(27, 107, 70, 0.28);
+
+  --status-nominal: #1b6b46;
+  --status-nominal-bg: rgba(27, 107, 70, 0.10);
+  --status-nominal-border: rgba(27, 107, 70, 0.25);
+
+  --status-active: #275f78;
+  --status-active-bg: rgba(39, 95, 120, 0.09);
+  --status-active-border: rgba(39, 95, 120, 0.24);
+
+  --status-warn: #9a5b13;
+  --status-warn-bg: rgba(154, 91, 19, 0.10);
+  --status-warn-border: rgba(154, 91, 19, 0.26);
+
+  --status-danger: #a8322d;
+  --status-danger-bg: rgba(168, 50, 45, 0.09);
+  --status-danger-border: rgba(168, 50, 45, 0.25);
+
+  --status-violet: #60488a;
+  --status-violet-bg: rgba(96, 72, 138, 0.09);
+  --status-violet-border: rgba(96, 72, 138, 0.24);
+
+  --scrollbar-thumb: rgba(65, 55, 42, 0.20);
+  --scrollbar-track: transparent;
+
+  accent-color: #1b6b46;
+  @supports (color: light-dark(white, black)) {
+    accent-color: light-dark(#1b6b46, #6bc295);
+  }
+
+  &:has(> head > meta[name="color-scheme"][content="dark"]) {
+    color-scheme: dark;
+  }
+
+  &:has(> head > meta[name="color-scheme"][content="light"]) {
+    color-scheme: light;
+  }
 }
-::-webkit-scrollbar-track {
-  background: #0b0f17;
+
+@media (prefers-color-scheme: dark) {
+  :root:not(:has(> head > meta[name="color-scheme"][content="light"])) {
+    --bg-canvas: #121513;
+    --bg-sidebar: #0e110f;
+    --bg-surface: #181c19;
+    --bg-elevated: #1e2320;
+    --bg-recessed: #151916;
+    --bg-bubble: #222824;
+    --bg-hover: rgba(236, 240, 234, 0.05);
+    --bg-active: #252c27;
+
+    --border-hairline: rgba(232, 236, 229, 0.09);
+    --border-strong: rgba(232, 236, 229, 0.17);
+
+    --ink-primary: #efece6;
+    --ink-secondary: #a9a79f;
+    --ink-muted: #787770;
+
+    --accent: #6bc295;
+    --accent-strong: #86d4ab;
+    --accent-pill: #4d9e74;
+    --accent-soft: rgba(107, 194, 149, 0.13);
+    --accent-border: rgba(107, 194, 149, 0.30);
+
+    --status-nominal: #6bc295;
+    --status-nominal-bg: rgba(107, 194, 149, 0.12);
+    --status-nominal-border: rgba(107, 194, 149, 0.28);
+
+    --status-active: #78b3d4;
+    --status-active-bg: rgba(120, 179, 212, 0.12);
+    --status-active-border: rgba(120, 179, 212, 0.26);
+
+    --status-warn: #e2ad5c;
+    --status-warn-bg: rgba(226, 173, 92, 0.12);
+    --status-warn-border: rgba(226, 173, 92, 0.28);
+
+    --status-danger: #e47d76;
+    --status-danger-bg: rgba(228, 125, 118, 0.12);
+    --status-danger-border: rgba(228, 125, 118, 0.28);
+
+    --status-violet: #b69ee0;
+    --status-violet-bg: rgba(182, 158, 224, 0.12);
+    --status-violet-border: rgba(182, 158, 224, 0.26);
+
+    --scrollbar-thumb: rgba(232, 236, 229, 0.16);
+    --scrollbar-track: transparent;
+  }
 }
-::-webkit-scrollbar-thumb {
-  background: #334155;
-  border-radius: 9999px;
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
+.dark {
+  --bg-canvas: #121513;
+  --bg-sidebar: #0e110f;
+  --bg-surface: #181c19;
+  --bg-elevated: #1e2320;
+  --bg-recessed: #151916;
+  --bg-bubble: #222824;
+  --bg-hover: rgba(236, 240, 234, 0.05);
+  --bg-active: #252c27;
+
+  --border-hairline: rgba(232, 236, 229, 0.09);
+  --border-strong: rgba(232, 236, 229, 0.17);
+
+  --ink-primary: #efece6;
+  --ink-secondary: #a9a79f;
+  --ink-muted: #787770;
+
+  --accent: #6bc295;
+  --accent-strong: #86d4ab;
+  --accent-pill: #4d9e74;
+  --accent-soft: rgba(107, 194, 149, 0.13);
+  --accent-border: rgba(107, 194, 149, 0.30);
+
+  --status-nominal: #6bc295;
+  --status-nominal-bg: rgba(107, 194, 149, 0.12);
+  --status-nominal-border: rgba(107, 194, 149, 0.28);
+
+  --status-active: #78b3d4;
+  --status-active-bg: rgba(120, 179, 212, 0.12);
+  --status-active-border: rgba(120, 179, 212, 0.26);
+
+  --status-warn: #e2ad5c;
+  --status-warn-bg: rgba(226, 173, 92, 0.12);
+  --status-warn-border: rgba(226, 173, 92, 0.28);
+
+  --status-danger: #e47d76;
+  --status-danger-bg: rgba(228, 125, 118, 0.12);
+  --status-danger-border: rgba(228, 125, 118, 0.28);
+
+  --status-violet: #b69ee0;
+  --status-violet-bg: rgba(182, 158, 224, 0.12);
+  --status-violet-border: rgba(182, 158, 224, 0.26);
+
+  --scrollbar-thumb: rgba(232, 236, 229, 0.16);
+  --scrollbar-track: transparent;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    font-family: var(--font-sans);
+    background-color: var(--bg-canvas);
+    color: var(--ink-primary);
+  }
+
+  .font-serif {
+    font-family: var(--font-serif);
+  }
+
+  code,
+  pre,
+  kbd,
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  button:not(:disabled),
+  select:not(:disabled),
+  a[href] {
+    cursor: pointer;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  }
+
+  @supports not (scrollbar-color: auto) {
+    * {
+      scrollbar-width: auto;
+    }
+
+    *::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+
+    *::-webkit-scrollbar-track {
+      background: var(--scrollbar-track);
+    }
+
+    *::-webkit-scrollbar-thumb {
+      background-color: var(--scrollbar-thumb);
+      border-radius: 9999px;
+    }
+  }
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+dialog.foundry-dialog {
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background-color: var(--bg-surface);
+  color: var(--ink-primary);
+  max-width: min(780px, calc(100vw - 2rem));
+  width: 100%;
+  max-height: calc(100vh - 3rem);
+  overflow: hidden;
+  box-shadow: 0 24px 60px -12px rgba(20, 16, 10, 0.24);
+}
+
+.dark dialog.foundry-dialog {
+  box-shadow: 0 24px 64px -12px rgba(0, 0, 0, 0.62);
+}
+
+dialog.foundry-dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.foundry-dialog::backdrop {
+  background-color: rgba(20, 18, 14, 0.42);
+  backdrop-filter: blur(2px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+.dark dialog.foundry-dialog::backdrop {
+  background-color: rgba(5, 8, 6, 0.68);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

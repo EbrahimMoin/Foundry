@@ -174,6 +174,33 @@ async def test_daemon_api_endpoints_and_ws_after_seq(tmp_path: Path) -> None:
             json={"allow_free_tier": True, "allow_trace_export": False},
         ).json()
         assert updated_dp["allow_free_tier"] is True
+        partial_dp = client.put(
+            "/api/settings/data-policy",
+            json={"allow_trace_export": True},
+        ).json()
+        assert partial_dp["allow_free_tier"] is True
+        assert partial_dp["allow_trace_export"] is True
+
+        runtime_cfg = client.get("/api/settings/runtime").json()
+        assert runtime_cfg["server"]["port"] == 4200
+        assert runtime_cfg["runtime"]["max_heavy_exec_slots"] == 2
+        assert "encrypted_vault" in runtime_cfg["secrets_backends"]
+
+        # Operator notes / run chat persistence
+        assert client.get(f"/api/runs/{run.id}/notes").json() == []
+        created_note = client.post(
+            f"/api/runs/{run.id}/notes",
+            json={"body": "Keep Wave 1 minimal", "kind": "note"},
+        )
+        assert created_note.status_code == 200
+        assert created_note.json()["body"] == "Keep Wave 1 minimal"
+        created_gotcha = client.post(
+            f"/api/runs/{run.id}/chat",
+            json={"body": "Avoid breaking cursor schema", "kind": "gotcha"},
+        )
+        assert created_gotcha.status_code == 200
+        notes_list = client.get(f"/api/runs/{run.id}/notes").json()
+        assert len(notes_list) == 2
 
         preview = client.get(f"/api/preview/{run.id}/url?env=local").json()
         assert preview["available"] is True
@@ -190,8 +217,18 @@ async def test_daemon_api_endpoints_and_ws_after_seq(tmp_path: Path) -> None:
             assert all(s > cursor_seq for s in seqs)
             assert seqs == sorted(seqs)
 
+            # New note triggers live `run.note_logged` event over WebSocket
+            note_resp = client.post(
+                f"/api/runs/{run.id}/notes",
+                json={"body": "Live note event check", "kind": "note"},
+            )
+            assert note_resp.status_code == 200
+            live_note_ev = ws.receive_json()
+            assert live_note_ev["type"] == "run.note_logged"
+            assert live_note_ev["publish_seq"] > seqs[-1]
+
             # Stop run triggers new committed + published outbox event streamed live
             stop_resp = client.post(f"/api/runs/{run.id}/stop")
             assert stop_resp.status_code == 200
             live_1 = ws.receive_json()
-            assert live_1["publish_seq"] > seqs[-1]
+            assert live_1["publish_seq"] > live_note_ev["publish_seq"]

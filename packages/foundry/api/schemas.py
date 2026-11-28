@@ -13,7 +13,15 @@ from foundry.blackboard.models import (
     TaskRecord,
     WriteReservationRecord,
 )
-from foundry.config.schemas import AutonomyOverrides, AutonomyPreset
+from foundry.config.schemas import (
+    AutonomyOverrides,
+    AutonomyPreset,
+    EmbeddingsConfig,
+    GlobalBudgetConfig,
+    ObservabilityConfig,
+    RuntimeConfig,
+    ServerConfig,
+)
 
 
 class ProjectSummary(BaseModel):
@@ -137,8 +145,28 @@ class AutonomyUpdate(BaseModel):
 class DataPolicyUpdate(BaseModel):
     """Update project privacy/data policy switches."""
 
-    allow_free_tier: bool
-    allow_trace_export: bool = False
+    allow_free_tier: bool | None = None
+    allow_trace_export: bool | None = None
+
+
+class NoteCreateRequest(BaseModel):
+    """Persist an operator note or gotcha into the run Blackboard (`notes` table)."""
+
+    body: str = Field(min_length=1, max_length=8000)
+    kind: Literal["note", "gotcha"] = "note"
+    task_id: str | None = None
+    feature: str | None = None
+
+
+class RuntimeSettingsResponse(BaseModel):
+    """Sanitized read-only summary of `foundry.yaml` daemon & sandbox invariants."""
+
+    server: ServerConfig
+    runtime: RuntimeConfig
+    embeddings: EmbeddingsConfig
+    observability: ObservabilityConfig
+    budgets: GlobalBudgetConfig
+    secrets_backends: list[Literal["keyring", "encrypted_vault"]] = Field(default_factory=list)
 
 
 class PreviewUrlResponse(BaseModel):

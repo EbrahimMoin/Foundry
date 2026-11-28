@@ -1,4 +1,6 @@
+import { useState } from "react";
 import type { CostsSummaryResponse, MetricsSummaryResponse } from "../types";
+import { computeBudgetMetrics } from "../utils/foundryMetrics";
 
 interface CostsMetricsPanelProps {
   costs: CostsSummaryResponse | null;
@@ -6,63 +8,122 @@ interface CostsMetricsPanelProps {
 }
 
 export function CostsMetricsPanel({ costs, metrics }: CostsMetricsPanelProps) {
-  if (!costs && !metrics) {
-    return <p className="text-xs text-slate-500">Select a run to inspect costs and telemetry.</p>;
-  }
+  const [groupBy, setGroupBy] = useState<"model" | "profile">("model");
+  const budget = computeBudgetMetrics(costs);
+  const rows = groupBy === "model" ? (costs?.by_model ?? []) : (costs?.by_profile ?? []);
 
   return (
-    <div className="space-y-3 text-xs">
-      {costs && (
-        <div className="grid grid-cols-2 gap-2">
-          <div className="rounded border border-panelBorder bg-obsidian p-2.5">
-            <div className="text-[11px] text-slate-400">Run Spend</div>
-            <div className="mt-0.5 font-mono text-sm font-semibold text-amber-300">
-              ${costs.spent_usd.toFixed(4)}
-            </div>
+    <div className="p-4 space-y-6 overflow-y-auto h-full">
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <div className="text-[11.5px] text-[var(--ink-muted)]">Run Spend</div>
+          <div
+            className="mt-1 font-mono text-[22px] font-semibold tabular"
+            style={{ color: "var(--ink-primary)" }}
+          >
+            ${(costs?.spent_usd ?? 0).toFixed(4)}
           </div>
-          <div className="rounded border border-panelBorder bg-obsidian p-2.5">
-            <div className="text-[11px] text-slate-400">Prefix Cache Hit</div>
-            <div className="mt-0.5 font-mono text-sm font-semibold text-emerald-300">
-              {(costs.cache_hit_rate * 100).toFixed(1)}%
-            </div>
+          <div className="mt-1 text-[11.5px] text-[var(--ink-muted)] tabular">
+            of ${(costs?.budget_usd ?? 0).toFixed(2)} ({budget.utilizationPct.toFixed(1)}%)
           </div>
         </div>
-      )}
 
-      {costs && costs.by_model.length > 0 && (
-        <div className="rounded border border-panelBorder bg-obsidian p-2">
-          <div className="mb-1.5 text-[11px] font-semibold text-slate-400">By Model</div>
-          {costs.by_model.map((m) => (
-            <div key={m.key} className="flex items-center justify-between py-0.5 font-mono text-[11px]">
-              <span className="truncate text-slate-200">{m.key}</span>
-              <span className="text-amber-300">
-                {m.calls}x · ${m.cost_usd.toFixed(4)}
-              </span>
-            </div>
-          ))}
+        <div>
+          <div className="text-[11.5px] text-[var(--ink-muted)]">Cache Hit Rate</div>
+          <div
+            className="mt-1 font-mono text-[22px] font-semibold tabular"
+            style={{ color: "var(--status-nominal)" }}
+          >
+            {((costs?.cache_hit_rate ?? 0) * 100).toFixed(1)}%
+          </div>
+          <div className="mt-1 text-[11.5px] text-[var(--ink-muted)] tabular">
+            ~${budget.estCacheSavingsUsd.toFixed(2)} saved
+          </div>
         </div>
-      )}
+      </div>
+
+      <section aria-label="Spend breakdown">
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-[11.5px] font-medium text-[var(--ink-muted)]">Breakdown</h2>
+          <div className="flex items-center gap-1 text-[11.5px]">
+            {(["model", "profile"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setGroupBy(mode)}
+                className="px-2 py-0.5 rounded-[5px] capitalize transition-colors"
+                style={
+                  groupBy === mode
+                    ? { backgroundColor: "var(--bg-active)", color: "var(--ink-primary)" }
+                    : { color: "var(--ink-muted)" }
+                }
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div
+          className="rounded-[8px] border divide-y font-mono text-[11.5px] tabular"
+          style={{
+            backgroundColor: "var(--bg-surface)",
+            borderColor: "var(--border-hairline)",
+          }}
+        >
+          {rows.length === 0 ? (
+            <div className="p-3 text-[var(--ink-muted)] font-sans">No calls yet.</div>
+          ) : (
+            rows.map((row) => (
+              <div
+                key={row.key}
+                className="px-3 py-2 flex items-center justify-between gap-2"
+                style={{ borderColor: "var(--border-hairline)" }}
+              >
+                <span className="text-[var(--ink-primary)] truncate">
+                  {row.key.replace(/^[^/]+\//, "")}
+                </span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <span className="text-[var(--ink-muted)]">{row.calls}×</span>
+                  <span className="font-semibold text-[var(--ink-primary)]">
+                    ${row.cost_usd.toFixed(4)}
+                  </span>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
 
       {metrics && (
-        <div className="rounded border border-panelBorder bg-obsidian p-2 space-y-1">
-          <div className="text-[11px] font-semibold text-slate-400">Run Health</div>
-          <div className="flex justify-between text-slate-300">
-            <span>Active Write Locks</span>
-            <span className="font-mono">{metrics.active_reservations}</span>
+        <section aria-label="Run health" className="space-y-3">
+          <h2 className="text-[11.5px] font-medium text-[var(--ink-muted)]">Run Health</h2>
+          <div
+            className="rounded-[8px] border divide-y text-[12.5px]"
+            style={{
+              backgroundColor: "var(--bg-surface)",
+              borderColor: "var(--border-hairline)",
+            }}
+          >
+            {[
+              { label: "Active write locks", value: metrics.active_reservations },
+              { label: "Locked contracts", value: metrics.contracts_count },
+              { label: "G3 dispute rounds", value: metrics.dispute_rounds_total },
+              { label: "Outbox events", value: metrics.events_count },
+            ].map((item) => (
+              <div
+                key={item.label}
+                className="px-3 py-2 flex items-center justify-between"
+                style={{ borderColor: "var(--border-hairline)" }}
+              >
+                <span className="text-[var(--ink-secondary)]">{item.label}</span>
+                <span className="font-mono font-medium tabular text-[var(--ink-primary)]">
+                  {item.value}
+                </span>
+              </div>
+            ))}
           </div>
-          <div className="flex justify-between text-slate-300">
-            <span>Contracts Locked</span>
-            <span className="font-mono">{metrics.contracts_count}</span>
-          </div>
-          <div className="flex justify-between text-slate-300">
-            <span>G3 Dispute Rounds</span>
-            <span className="font-mono">{metrics.dispute_rounds_total}</span>
-          </div>
-          <div className="flex justify-between text-slate-300">
-            <span>Outbox Events</span>
-            <span className="font-mono">{metrics.events_count}</span>
-          </div>
-        </div>
+        </section>
       )}
     </div>
   );

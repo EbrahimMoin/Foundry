@@ -18,9 +18,11 @@ from foundry.api.schemas import (
     MetricsSummaryResponse,
     ModelAssignmentsUpdate,
     ModelCostBucket,
+    NoteCreateRequest,
     PreviewUrlResponse,
     ProjectSummary,
     RunControlResponse,
+    RuntimeSettingsResponse,
     TaskDetailResponse,
 )
 from foundry.api.state import DaemonState
@@ -29,6 +31,7 @@ from foundry.blackboard.models import (
     ContractRecord,
     DecisionRecord,
     LlmCallRecord,
+    NoteRecord,
     RunRecord,
     TaskRecord,
     WriteReservationRecord,
@@ -36,8 +39,10 @@ from foundry.blackboard.models import (
 from foundry.blackboard.repository import NotFoundError, StaleWriteError
 from foundry.config.loader import (
     ConfigError,
+    default_foundry_config,
     default_models_config,
     default_project_config,
+    load_foundry_config,
     load_models_config,
     load_project_config,
     save_models_config,
@@ -46,6 +51,7 @@ from foundry.config.loader import (
 from foundry.config.schemas import (
     AutonomyConfig,
     DataPolicyConfig,
+    FoundryGlobalConfig,
     ModelsConfig,
     ProjectConfig,
     ProviderConfig,
@@ -61,6 +67,11 @@ def _state(request: Request) -> DaemonState:
 def _load_models(config_dir: Path) -> ModelsConfig:
     path = config_dir / "models.yaml"
     return load_models_config(path) if path.is_file() else default_models_config()
+
+
+def _load_foundry(config_dir: Path) -> FoundryGlobalConfig:
+    path = config_dir / "foundry.yaml"
+    return load_foundry_config(path) if path.is_file() else default_foundry_config()
 
 
 def _load_project(project_dir: Path) -> ProjectConfig:
@@ -278,6 +289,76 @@ async def list_decisions(
     return await st.repo.list_decisions(run_id=run_id, status=status)
 
 
+@api_router.get("/runs/{run_id}/notes", response_model=list[NoteRecord])
+async def list_run_notes(
+    run_id: str,
+    request: Request,
+    feature: str | None = Query(default=None),
+) -> list[NoteRecord]:
+    st = _state(request)
+    try:
+        await st.repo.get_run(run_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return await st.repo.list_notes(run_id, feature=feature)
+
+
+async def _create_run_note(
+    run_id: str,
+    body: NoteCreateRequest,
+    request: Request,
+) -> NoteRecord:
+    st = _state(request)
+    try:
+        await st.repo.get_run(run_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    cleaned = body.body.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Note body cannot be empty")
+
+    note = await st.repo.post_note(
+        run_id=run_id,
+        kind=body.kind,
+        body=cleaned,
+        task_id=body.task_id,
+        feature=body.feature,
+    )
+    await st.repo.emit_event(
+        run_id=run_id,
+        event_type="run.note_logged",
+        subject_id=note.id,
+        payload={
+            "note_id": note.id,
+            "kind": note.kind,
+            "body": note.body,
+            "task_id": note.task_id,
+            "feature": note.feature,
+        },
+    )
+    await st.relay.flush_once()
+    return note
+
+
+@api_router.post("/runs/{run_id}/notes", response_model=NoteRecord)
+async def create_run_note(
+    run_id: str,
+    body: NoteCreateRequest,
+    request: Request,
+) -> NoteRecord:
+    return await _create_run_note(run_id, body, request)
+
+
+@api_router.post("/runs/{run_id}/chat", response_model=NoteRecord)
+async def post_run_chat(
+    run_id: str,
+    body: NoteCreateRequest,
+    request: Request,
+) -> NoteRecord:
+    return await _create_run_note(run_id, body, request)
+
+
 @api_router.post("/decisions/{decision_id}/resolve", response_model=DecisionRecord)
 async def resolve_decision(
     decision_id: str,
@@ -462,12 +543,33 @@ async def update_settings_data_policy(
     st = _state(request)
     proj = _load_project(st.project_dir)
     new_policy = DataPolicyConfig(
-        allow_free_tier=body.allow_free_tier,
-        allow_trace_export=body.allow_trace_export,
+        allow_free_tier=(
+            body.allow_free_tier
+            if body.allow_free_tier is not None
+            else proj.data_policy.allow_free_tier
+        ),
+        allow_trace_export=(
+            body.allow_trace_export
+            if body.allow_trace_export is not None
+            else proj.data_policy.allow_trace_export
+        ),
     )
     updated_proj = proj.model_copy(update={"data_policy": new_policy})
     save_project_config(updated_proj, st.project_dir / ".foundry" / "project.yaml")
     return new_policy
+
+
+@api_router.get("/settings/runtime", response_model=RuntimeSettingsResponse)
+async def get_settings_runtime(request: Request) -> RuntimeSettingsResponse:
+    cfg = _load_foundry(_state(request).config_dir)
+    return RuntimeSettingsResponse(
+        server=cfg.server,
+        runtime=cfg.runtime,
+        embeddings=cfg.embeddings,
+        observability=cfg.observability,
+        budgets=cfg.budgets,
+        secrets_backends=list(cfg.secrets.backend_order),
+    )
 
 
 @api_router.get("/preview/{run_id}/url", response_model=PreviewUrlResponse)
