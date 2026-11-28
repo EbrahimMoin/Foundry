@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  AlertTriangle,
   Bot,
-  CheckCircle2,
+  KeyRound,
   Laptop,
+  Layers,
   Moon,
   RefreshCw,
   Shield,
@@ -18,19 +18,15 @@ import type {
   AutonomyOverrides,
   DataPolicyConfig,
   DecisionModeOption,
-  ModelsConfig,
   RuntimeSettingsResponse,
 } from "../types";
-import {
-  checkVerifierDiversity,
-  normalizeProfileKey,
-  resolveProfileFamily,
-} from "../utils/foundryMetrics";
+import type { InspectorSection } from "./CommandDock";
 
-export type SettingsTab = "general" | "autonomy" | "models" | "privacy";
+export type SettingsTab = "general" | "autonomy" | "privacy";
 
 interface SettingsModalProps {
   open: boolean;
+  initialTab?: SettingsTab;
   onClose: () => void;
   themePreference: ThemePreference;
   systemTheme: ResolvedTheme;
@@ -47,22 +43,11 @@ interface SettingsModalProps {
     overrides?: AutonomyOverrides;
     confidence_threshold?: number;
   }) => Promise<void>;
-  models: ModelsConfig | null;
-  onUpdateRole: (role: string, profile: string) => Promise<void>;
   dataPolicy: DataPolicyConfig | null;
   onUpdateDataPolicy: (patch: Partial<DataPolicyConfig>) => Promise<void>;
   runtimeSettings: RuntimeSettingsResponse | null;
+  onOpenWorkbench: (section: InspectorSection) => void;
 }
-
-const ROLE_ORDER = [
-  "orchestrator",
-  "lead",
-  "implementer",
-  "test_writer",
-  "reviewer",
-  "integration",
-  "release",
-];
 
 const OVERRIDE_CATEGORIES: Array<{
   key: keyof AutonomyOverrides;
@@ -89,6 +74,7 @@ const PRESET_OPTIONS: Array<{
 
 export function SettingsModal({
   open,
+  initialTab = "general",
   onClose,
   themePreference,
   systemTheme,
@@ -101,19 +87,25 @@ export function SettingsModal({
   onReconnectDaemon,
   autonomy,
   onUpdateAutonomy,
-  models,
-  onUpdateRole,
   dataPolicy,
   onUpdateDataPolicy,
   runtimeSettings,
+  onOpenWorkbench,
 }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [thresholdDraft, setThresholdDraft] = useState<number>(
     autonomy?.confidence_threshold ?? 0.6
   );
   const [savingLabel, setSavingLabel] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
+
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setActiveTab(initialTab);
+    }
+  }, [open, initialTab]);
 
   useEffect(() => {
     if (autonomy) {
@@ -121,7 +113,6 @@ export function SettingsModal({
     }
   }, [autonomy]);
 
-  // Open/close native modal top layer
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
@@ -163,19 +154,8 @@ export function SettingsModal({
   const navItems: Array<{ key: SettingsTab; label: string; icon: typeof Sliders }> = [
     { key: "general", label: "General", icon: Sliders },
     { key: "autonomy", label: "Autonomy", icon: Sparkles },
-    { key: "models", label: "Models", icon: Bot },
     { key: "privacy", label: "Privacy & Runtime", icon: Shield },
   ];
-
-  const diversity = models ? checkVerifierDiversity(models) : null;
-  const profileEntries = models ? Object.entries(models.profiles) : [];
-  const roleKeys = models
-    ? Object.keys(models.assignments.roles).sort((a, b) => {
-        const ia = ROLE_ORDER.indexOf(a);
-        const ib = ROLE_ORDER.indexOf(b);
-        return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
-      })
-    : [];
 
   return (
     <dialog
@@ -185,10 +165,10 @@ export function SettingsModal({
       className="foundry-dialog"
       onClose={onClose}
     >
-      <div className="flex flex-col sm:flex-row h-[min(560px,84vh)] w-full">
-        {/* Left Navigation Column (Claude-style settings rail) */}
+      <div className="flex flex-col sm:flex-row h-[min(560px,86vh)] w-full">
+        {/* Left Navigation Column */}
         <aside
-          className="sm:w-[196px] shrink-0 border-b sm:border-b-0 sm:border-r flex flex-col justify-between p-4"
+          className="sm:w-[198px] shrink-0 border-b sm:border-b-0 sm:border-r flex flex-col justify-between p-4"
           style={{
             backgroundColor: "var(--bg-sidebar)",
             borderColor: "var(--border-hairline)",
@@ -324,6 +304,53 @@ export function SettingsModal({
                   </div>
                 </div>
 
+                {/* Quick Jump to Right Sidebar Workbench */}
+                <div
+                  className="rounded-xl border p-4 space-y-2.5"
+                  style={{
+                    backgroundColor: "var(--bg-canvas)",
+                    borderColor: "var(--border-hairline)",
+                  }}
+                >
+                  <div className="text-[12.5px] font-medium text-[var(--ink-primary)]">
+                    Agents, API Keys &amp; Models Workbench
+                  </div>
+                  <p className="text-[11.5px] text-[var(--ink-muted)]">
+                    Managed directly in the right sidebar so keys, providers, and models stay
+                    side-by-side with your workspace.
+                  </p>
+                  <div className="flex flex-wrap gap-2 pt-0.5">
+                    {(
+                      [
+                        { key: "agents" as const, label: "Agents", icon: Layers },
+                        { key: "keys" as const, label: "API Keys & CLI", icon: KeyRound },
+                        { key: "models" as const, label: "Models", icon: Bot },
+                      ] as const
+                    ).map((item) => {
+                      const Icon = item.icon;
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onOpenWorkbench(item.key);
+                          }}
+                          className="h-8 px-3 rounded-lg border inline-flex items-center gap-1.5 text-[12px] font-medium hover:bg-[var(--bg-hover)]"
+                          style={{
+                            backgroundColor: "var(--bg-surface)",
+                            borderColor: "var(--border-hairline)",
+                            color: "var(--ink-primary)",
+                          }}
+                        >
+                          <Icon className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
+                          {item.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 <div
                   className="rounded-xl border divide-y text-[13px]"
                   style={{
@@ -358,7 +385,7 @@ export function SettingsModal({
                         Preview demo dataset
                       </div>
                       <div className="text-[12px] text-[var(--ink-muted)]">
-                        Inspect sample Wave 2 telemetry even while connected to a clean local daemon
+                        Inspect sample Wave 2 telemetry alongside the clean chat UI
                       </div>
                     </div>
                     <input
@@ -564,147 +591,13 @@ export function SettingsModal({
               </>
             )}
 
-            {/* TAB 3: MODELS & PROVIDERS */}
-            {activeTab === "models" && models && (
-              <>
-                {diversity &&
-                  (diversity.diverse ? (
-                    <div
-                      className="rounded-xl border px-3.5 py-2.5 flex items-center gap-2.5 text-[12.5px]"
-                      style={{
-                        backgroundColor: "var(--status-nominal-bg)",
-                        borderColor: "var(--status-nominal-border)",
-                        color: "var(--ink-primary)",
-                      }}
-                    >
-                      <CheckCircle2
-                        className="w-4 h-4 shrink-0"
-                        style={{ color: "var(--status-nominal)" }}
-                      />
-                      <span>
-                        Cross-family G3/G4 diversity verified ({diversity.implementerFamily} vs{" "}
-                        {Array.from(new Set(diversity.verifierProfiles.map((v) => v.family))).join(
-                          ", "
-                        )}
-                        )
-                      </span>
-                    </div>
-                  ) : (
-                    <div
-                      className="rounded-xl border px-3.5 py-2.5 flex items-start gap-2.5 text-[12.5px]"
-                      style={{
-                        backgroundColor: "var(--status-danger-bg)",
-                        borderColor: "var(--status-danger-border)",
-                        color: "var(--ink-primary)",
-                      }}
-                    >
-                      <AlertTriangle
-                        className="w-4 h-4 shrink-0 mt-0.5"
-                        style={{ color: "var(--status-danger)" }}
-                      />
-                      <span>
-                        Verifier collision: {diversity.sameFamilyRoles.join(", ")} share family{" "}
-                        <span className="font-mono">{diversity.implementerFamily}</span> with
-                        implementer.
-                      </span>
-                    </div>
-                  ))}
-
-                <div className="space-y-2">
-                  <h4 className="text-[13px] font-semibold text-[var(--ink-primary)]">
-                    Agent Role Assignments (`models.yaml`)
-                  </h4>
-                  <div
-                    className="rounded-xl border divide-y"
-                    style={{
-                      backgroundColor: "var(--bg-canvas)",
-                      borderColor: "var(--border-hairline)",
-                    }}
-                  >
-                    {roleKeys.map((role) => {
-                      const currentRef = normalizeProfileKey(models.assignments.roles[role]);
-                      const family = resolveProfileFamily(models, currentRef);
-                      return (
-                        <div
-                          key={role}
-                          className="px-4 py-2.5 flex items-center justify-between gap-3"
-                          style={{ borderColor: "var(--border-hairline)" }}
-                        >
-                          <div className="min-w-0">
-                            <div className="text-[13px] font-medium text-[var(--ink-primary)]">
-                              {role}
-                            </div>
-                            <div className="font-mono text-[11px] text-[var(--ink-muted)]">
-                              family: {family}
-                            </div>
-                          </div>
-                          <select
-                            aria-label={`Profile for ${role}`}
-                            value={currentRef}
-                            onChange={async (e) => {
-                              await onUpdateRole(role, e.target.value);
-                              flashSaved(`${role} assigned`);
-                            }}
-                            className="h-8 rounded-lg border px-2.5 font-mono text-[11.5px] max-w-[230px]"
-                            style={{
-                              backgroundColor: "var(--bg-surface)",
-                              borderColor: "var(--border-hairline)",
-                              color: "var(--ink-primary)",
-                            }}
-                          >
-                            {profileEntries.map(([pk, prof]) => {
-                              const normKey = normalizeProfileKey(pk);
-                              return (
-                                <option key={normKey} value={normKey}>
-                                  {normKey} · {prof.model}
-                                </option>
-                              );
-                            })}
-                          </select>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <h4 className="text-[13px] font-semibold text-[var(--ink-primary)]">
-                    First-Party SDK Transports ({Object.keys(models.providers).length})
-                  </h4>
-                  <div
-                    className="rounded-xl border divide-y font-mono text-[11.5px]"
-                    style={{
-                      backgroundColor: "var(--bg-canvas)",
-                      borderColor: "var(--border-hairline)",
-                    }}
-                  >
-                    {Object.entries(models.providers).map(([name, cfg]) => (
-                      <div
-                        key={name}
-                        className="px-4 py-2 flex items-center justify-between gap-3"
-                        style={{ borderColor: "var(--border-hairline)" }}
-                      >
-                        <div className="min-w-0">
-                          <span className="text-[var(--ink-primary)] font-medium">{name}</span>
-                          <span className="text-[var(--ink-muted)] ml-2">{cfg.transport}</span>
-                        </div>
-                        <span className="text-[var(--ink-secondary)] shrink-0">
-                          {cfg.billing_mode} · {cfg.data_tier}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
-            )}
-
-            {/* TAB 4: PRIVACY & RUNTIME INVARIANTS */}
+            {/* TAB 3: PRIVACY & RUNTIME INVARIANTS */}
             {activeTab === "privacy" && (
               <>
                 {dataPolicy && (
                   <div className="space-y-2">
                     <h4 className="text-[13px] font-semibold text-[var(--ink-primary)]">
-                      Data & Egress Policy
+                      Data &amp; Egress Policy
                     </h4>
                     <div
                       className="rounded-xl border divide-y text-[13px]"
@@ -765,7 +658,7 @@ export function SettingsModal({
                 {runtimeSettings && (
                   <div className="space-y-2">
                     <h4 className="text-[13px] font-semibold text-[var(--ink-primary)]">
-                      Runtime & Sandbox Guardrails (`foundry.yaml`, read-only)
+                      Runtime &amp; Sandbox Guardrails (`foundry.yaml`, read-only)
                     </h4>
                     <div
                       className="rounded-xl border divide-y text-[12.5px]"

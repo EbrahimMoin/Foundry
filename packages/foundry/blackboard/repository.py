@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
-from sqlalchemy import select, text, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from ulid import ULID
@@ -32,6 +32,7 @@ from foundry.blackboard.models import (
     EventRow,
     FeatureRecord,
     FeatureRow,
+    IncidentRow,
     LlmCallRecord,
     LlmCallRow,
     MessageRecord,
@@ -39,6 +40,7 @@ from foundry.blackboard.models import (
     NoteRecord,
     NoteRow,
     ProcessedEventRow,
+    ReleaseRow,
     ReservationConflict,
     RunRecord,
     RunRow,
@@ -276,6 +278,8 @@ class BlackboardRepository(Protocol):
     async def get_run(self, run_id: str) -> RunRecord: ...
 
     async def list_runs(self, project_id: str | None = None) -> list[RunRecord]: ...
+
+    async def delete_run(self, run_id: str) -> None: ...
 
     async def update_run_phase(
         self,
@@ -561,6 +565,8 @@ class BlackboardRepository(Protocol):
         thread_id: str | None = None,
     ) -> str: ...
 
+    async def get_thread(self, thread_id: str) -> dict[str, Any] | None: ...
+
     async def post_message(
         self,
         *,
@@ -675,6 +681,64 @@ class PostgresBlackboardRepository:
             stmt = stmt.order_by(RunRow.started_at.desc(), RunRow.id.desc())
             rows = (await s.scalars(stmt)).all()
             return [_to_run_dto(r) for r in rows]
+
+    async def delete_run(self, run_id: str) -> None:
+        async with self._db.session_factory() as s, s.begin():
+            existing = await s.get(RunRow, run_id)
+            if existing is None:
+                raise NotFoundError(f"Run not found: {run_id}")
+
+            thread_ids = select(ThreadRow.id).where(ThreadRow.run_id == run_id)
+            contract_ids = select(ContractRow.id).where(ContractRow.run_id == run_id)
+            task_ids = select(TaskRow.id).where(TaskRow.run_id == run_id)
+
+            await s.execute(delete(MessageRow).where(MessageRow.thread_id.in_(thread_ids)))
+            await s.execute(delete(ThreadRow).where(ThreadRow.run_id == run_id))
+            await s.execute(delete(NoteRow).where(NoteRow.run_id == run_id))
+            await s.execute(delete(IncidentRow).where(IncidentRow.run_id == run_id))
+            await s.execute(
+                update(ReleaseRow)
+                .where(ReleaseRow.run_id == run_id)
+                .values(previous_release_id=None)
+            )
+            await s.execute(delete(ReleaseRow).where(ReleaseRow.run_id == run_id))
+            await s.execute(delete(DecisionRow).where(DecisionRow.run_id == run_id))
+            await s.execute(
+                delete(ContractChangeRequestRow).where(
+                    ContractChangeRequestRow.contract_id.in_(contract_ids)
+                )
+            )
+            await s.execute(
+                delete(ContractSubscriptionRow).where(
+                    ContractSubscriptionRow.contract_id.in_(contract_ids)
+                )
+            )
+            await s.execute(
+                delete(ContractVersionRow).where(ContractVersionRow.contract_id.in_(contract_ids))
+            )
+            await s.execute(delete(ContractRow).where(ContractRow.run_id == run_id))
+            await s.execute(delete(WriteReservationRow).where(WriteReservationRow.run_id == run_id))
+            await s.execute(delete(TaskWriteSetRow).where(TaskWriteSetRow.task_id.in_(task_ids)))
+            await s.execute(
+                delete(TaskDependencyRow).where(
+                    (TaskDependencyRow.task_id.in_(task_ids))
+                    | (TaskDependencyRow.depends_on_task_id.in_(task_ids))
+                )
+            )
+            await s.execute(
+                update(TaskRow)
+                .where(TaskRow.run_id == run_id)
+                .values(parent_task_id=None, owner_agent_id=None)
+            )
+            await s.execute(delete(TaskRow).where(TaskRow.run_id == run_id))
+            await s.execute(
+                update(AgentRow).where(AgentRow.run_id == run_id).values(parent_agent_id=None)
+            )
+            await s.execute(delete(AgentRow).where(AgentRow.run_id == run_id))
+            await s.execute(delete(FeatureRow).where(FeatureRow.run_id == run_id))
+            await s.execute(delete(LlmCallRow).where(LlmCallRow.run_id == run_id))
+            await s.execute(delete(EventRow).where(EventRow.run_id == run_id))
+            await s.execute(delete(RunRow).where(RunRow.id == run_id))
 
     async def update_run_phase(
         self,
@@ -1767,6 +1831,19 @@ class PostgresBlackboardRepository:
                 s.add(ThreadRow(id=tid, run_id=run_id, kind=kind, subject_id=subject_id))
             return tid
 
+    async def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        async with self._db.session_factory() as s:
+            row = await s.get(ThreadRow, thread_id)
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "run_id": row.run_id,
+                "kind": row.kind,
+                "subject_id": row.subject_id,
+                "created_at": row.created_at,
+            }
+
     async def post_message(
         self,
         *,
@@ -2069,6 +2146,57 @@ class InMemoryBlackboardRepository:
         items = [r for r in self._runs.values() if project_id is None or r.project_id == project_id]
         items.sort(key=lambda r: (r.started_at, r.id), reverse=True)
         return items
+
+    async def delete_run(self, run_id: str) -> None:
+        async with self._lock:
+            if run_id not in self._runs:
+                raise NotFoundError(f"Run not found: {run_id}")
+            del self._runs[run_id]
+
+            agent_ids = {aid for aid, ag in self._agents.items() if ag.run_id == run_id}
+            for aid in agent_ids:
+                self._agents.pop(aid, None)
+
+            task_ids = {tid for tid, t in self._tasks.items() if t.run_id == run_id}
+            for tid in task_ids:
+                self._tasks.pop(tid, None)
+                self._deps.pop(tid, None)
+                self._write_sets.pop(tid, None)
+
+            self._reservations = [r for r in self._reservations if r.run_id != run_id]
+
+            contract_ids = {cid for cid, c in self._contracts.items() if c.run_id == run_id}
+            for cid in contract_ids:
+                self._contracts.pop(cid, None)
+            for ver_key in [k for k in self._contract_versions if k[0] in contract_ids]:
+                self._contract_versions.pop(ver_key, None)
+            for sub_key in [k for k in self._contract_subscriptions if k[0] in contract_ids]:
+                self._contract_subscriptions.pop(sub_key, None)
+            for cr_id in [
+                cr_id
+                for cr_id, cr in self._change_requests.items()
+                if cr.contract_id in contract_ids
+            ]:
+                self._change_requests.pop(cr_id, None)
+
+            for feat_key in [k for k in self._features if k[0] == run_id]:
+                self._features.pop(feat_key, None)
+
+            decision_ids = {did for did, d in self._decisions.items() if d.run_id == run_id}
+            for did in decision_ids:
+                self._decisions.pop(did, None)
+            for ikey in [k for k, did in self._decision_keys.items() if did in decision_ids]:
+                self._decision_keys.pop(ikey, None)
+
+            thread_ids = {tid for tid, th in self._threads.items() if th.get("run_id") == run_id}
+            for tid in thread_ids:
+                self._threads.pop(tid, None)
+                self._messages.pop(tid, None)
+
+            self._notes = [n for n in self._notes if n.run_id != run_id]
+            self._llm_calls = [c for c in self._llm_calls if c.run_id != run_id]
+            self._events = [e for e in self._events if e.run_id != run_id]
+            self._save_hook()
 
     async def update_run_phase(
         self,
@@ -2970,6 +3098,12 @@ class InMemoryBlackboardRepository:
                 self._messages.setdefault(tid, [])
                 self._save_hook()
             return tid
+
+    async def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        raw = self._threads.get(thread_id)
+        if raw is None:
+            return None
+        return {"id": thread_id, **dict(raw)}
 
     async def post_message(
         self,

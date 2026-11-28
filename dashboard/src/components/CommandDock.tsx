@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { ArrowUp, Pause, Play, Square } from "lucide-react";
 import type { AutonomyConfig, CostsSummaryResponse, RunRecord } from "../types";
 
-export type InspectorSection = "decisions" | "models" | "costs" | "outbox";
+export type InspectorSection = "agents" | "keys" | "models" | "decisions" | "costs" | "outbox";
 
 interface CommandDockProps {
   run: RunRecord | null;
@@ -15,7 +15,7 @@ interface CommandDockProps {
   onPause: () => Promise<void>;
   onResume: () => Promise<void>;
   onStop: () => Promise<void>;
-  onPostNote: (text: string, kind: "note" | "gotcha") => Promise<void>;
+  onSendMessage: (text: string, mode: "chat" | "ai" | "gotcha") => Promise<void>;
 }
 
 const AUTONOMY_PRESETS: AutonomyConfig["preset"][] = [
@@ -37,24 +37,29 @@ export function CommandDock({
   onPause,
   onResume,
   onStop,
-  onPostNote,
+  onSendMessage,
 }: CommandDockProps) {
   const [input, setInput] = useState("");
-  const [kind, setKind] = useState<"note" | "gotcha">("note");
+  const [mode, setMode] = useState<"chat" | "ai" | "gotcha">("chat");
   const [submitting, setSubmitting] = useState(false);
 
-  const isPaused = run?.phase === "paused";
-  const isTerminal = run?.phase === "stopped" || run?.phase === "completed";
+  if (!run) return null;
+
+  const isPaused = run.phase === "paused";
+  const isTerminal = run.phase === "stopped" || run.phase === "completed";
+
+  const cycleMode = () => {
+    setMode((prev) => (prev === "chat" ? "ai" : prev === "ai" ? "gotcha" : "chat"));
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const trimmed = input.trim();
-    if (!trimmed || !run || submitting) return;
+    if (!trimmed || submitting) return;
     setSubmitting(true);
     try {
-      await onPostNote(trimmed, kind);
+      await onSendMessage(trimmed, mode);
       setInput("");
-      setKind("note");
     } finally {
       setSubmitting(false);
     }
@@ -63,7 +68,6 @@ export function CommandDock({
   return (
     <div className="shrink-0 px-6 pb-4 pt-2">
       <div className="max-w-[660px] mx-auto space-y-2">
-        {/* Rounded Pill Input with Optional Gotcha Toggle + Sage Send Button */}
         <form
           onSubmit={handleSubmit}
           className="h-[54px] rounded-full border pl-5 pr-2.5 flex items-center gap-2.5 transition-colors focus-within:border-[var(--border-strong)]"
@@ -76,40 +80,45 @@ export function CommandDock({
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            disabled={!run || submitting}
-            placeholder={run ? "Guide agents or log a run note…" : "Start a run to log guidance notes…"}
-            aria-label="Guide agents or log a run note"
+            disabled={submitting}
+            placeholder="Reply to orchestrator or log a gotcha…"
+            aria-label="Reply to orchestrator or log a gotcha"
             className="flex-1 min-w-0 bg-transparent font-serif text-[17.5px] outline-none placeholder:text-[var(--ink-muted)] disabled:opacity-60"
             style={{ color: "var(--ink-primary)" }}
           />
-          {run && input.trim().length > 0 && (
+          {input.trim().length > 0 && (
             <button
               type="button"
-              onClick={() => setKind((prev) => (prev === "note" ? "gotcha" : "note"))}
-              title="Toggle between run note and gotcha warning"
+              onClick={cycleMode}
+              title="Click to cycle: log chat, ask Orchestrator AI, or log Blackboard gotcha"
               className="px-2.5 py-1 rounded-full text-[11px] font-medium shrink-0 transition-colors"
               style={
-                kind === "gotcha"
+                mode === "gotcha"
                   ? {
                       backgroundColor: "var(--status-warn-bg)",
                       color: "var(--status-warn)",
                     }
-                  : {
-                      backgroundColor: "var(--bg-active)",
-                      color: "var(--ink-secondary)",
-                    }
+                  : mode === "ai"
+                    ? {
+                        backgroundColor: "var(--accent-soft)",
+                        color: "var(--accent)",
+                      }
+                    : {
+                        backgroundColor: "var(--bg-active)",
+                        color: "var(--ink-secondary)",
+                      }
               }
             >
-              {kind === "gotcha" ? "gotcha" : "note"}
+              {mode === "gotcha" ? "gotcha" : mode === "ai" ? "ask AI" : "chat"}
             </button>
           )}
           <button
             type="submit"
-            disabled={!run || !input.trim() || submitting}
-            aria-label="Send guidance"
+            disabled={!input.trim() || submitting}
+            aria-label="Send message"
             className="w-9 h-9 rounded-full flex items-center justify-center shrink-0 transition-colors disabled:opacity-50"
             style={{
-              backgroundColor: input.trim() && run ? "var(--accent)" : "var(--accent-pill)",
+              backgroundColor: input.trim() ? "var(--accent)" : "var(--accent-pill)",
               color: "#ffffff",
             }}
           >
@@ -117,21 +126,18 @@ export function CommandDock({
           </button>
         </form>
 
-        {/* Quiet Single-Line Control Caption */}
         <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[11.5px] text-[var(--ink-muted)]">
-          {run && (
-            <span className="inline-flex items-center gap-1.5">
-              <span
-                className="w-1.5 h-1.5 rounded-full"
-                style={{
-                  backgroundColor: wsConnected ? "var(--accent)" : "var(--ink-muted)",
-                }}
-              />
-              {run.phase.replace(/_/g, " ")}
-            </span>
-          )}
+          <span className="inline-flex items-center gap-1.5">
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                backgroundColor: wsConnected ? "var(--accent)" : "var(--ink-muted)",
+              }}
+            />
+            {run.phase.replace(/_/g, " ")}
+          </span>
 
-          {run && !isTerminal && (
+          {!isTerminal && (
             <>
               <span>·</span>
               {isPaused ? (
@@ -194,8 +200,8 @@ export function CommandDock({
             onClick={() => onToggleInspector("costs")}
             className="font-mono text-[11px] tabular hover:text-[var(--ink-primary)] transition-colors"
           >
-            ${(costs?.spent_usd ?? run?.spent_usd ?? 0).toFixed(2)} / $
-            {(costs?.budget_usd ?? run?.budget_usd ?? 5).toFixed(0)}
+            ${(costs?.spent_usd ?? run.spent_usd ?? 0).toFixed(2)} / $
+            {(costs?.budget_usd ?? run.budget_usd ?? 5).toFixed(0)}
           </button>
 
           <span>·</span>

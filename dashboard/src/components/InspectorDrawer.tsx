@@ -1,16 +1,29 @@
 import { useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
+import { AgentLayersStudio } from "./AgentLayersStudio";
+import { ApiKeysPanel } from "./ApiKeysPanel";
 import { CostsMetricsPanel } from "./CostsMetricsPanel";
 import { DecisionsPanel } from "./DecisionsPanel";
 import { ModelSwitcherPanel } from "./ModelSwitcherPanel";
 import type { InspectorSection } from "./CommandDock";
 import type {
+  AgentAuthSource,
+  AgentLayer,
+  AgentRecord,
+  AgentRole,
+  AgentRosterConfig,
+  ApiKeysStatusResponse,
   BlackboardEvent,
   CostsSummaryResponse,
   DataPolicyConfig,
   DecisionRecord,
+  KeyModelsResponse,
   MetricsSummaryResponse,
+  ModelProfileUpsertPayload,
   ModelsConfig,
+  OpenAISubscriptionStatus,
+  ProviderCatalogEntry,
+  TestConnectionResponse,
 } from "../types";
 import {
   classifyEventCategory,
@@ -22,6 +35,63 @@ interface InspectorDrawerProps {
   section: InspectorSection;
   onChangeSection: (section: InspectorSection) => void;
   onClose: () => void;
+  activeRunId: string | null;
+  runAgents: AgentRecord[];
+  roster: AgentRosterConfig | null;
+  apiKeys: ApiKeysStatusResponse | null;
+  catalog: ProviderCatalogEntry[];
+  openAiSub: OpenAISubscriptionStatus | null;
+  keyModelsMap: Record<string, string[]>;
+  onCreateAgentSlot: (payload: {
+    name: string;
+    layer: AgentLayer;
+    role: AgentRole;
+    domain?: string | null;
+    parent_id?: string | null;
+    model_profile: string;
+    auth_source?: AgentAuthSource;
+    api_key_var?: string | null;
+    model_name?: string | null;
+    enabled?: boolean;
+  }) => Promise<void>;
+  onUpdateAgentSlot: (
+    agentId: string,
+    payload: {
+      model_profile?: string;
+      auth_source?: AgentAuthSource;
+      api_key_var?: string | null;
+      model_name?: string | null;
+      clear_api_key?: boolean;
+      clear_model_name?: boolean;
+      enabled?: boolean;
+    }
+  ) => Promise<void>;
+  onDeleteAgentSlot: (agentId: string) => Promise<void>;
+  onAddRunAgent: (
+    runId: string,
+    payload: {
+      role: AgentRole;
+      domain?: string | null;
+      parent_agent_id?: string | null;
+      model_profile: string;
+    }
+  ) => Promise<void>;
+  onRemoveRunAgent: (runId: string, agentId: string) => Promise<void>;
+  onUnlockVault: (passphrase: string) => Promise<void>;
+  onSaveApiKey: (payload: {
+    name: string;
+    secret: string;
+    provider: string;
+    passphrase?: string;
+  }) => Promise<void>;
+  onDeleteApiKey: (name: string) => Promise<void>;
+  onFetchKeyModels: (name: string) => Promise<KeyModelsResponse>;
+  onToggleOpenAiSub: (enabled: boolean) => Promise<void>;
+  onTestConnection: (payload: {
+    auth_source: "api_key" | "openai_subscription";
+    api_key_var?: string | null;
+    model: string;
+  }) => Promise<TestConnectionResponse>;
   decisions: DecisionRecord[];
   onResolveDecision: (
     decisionId: string,
@@ -30,16 +100,19 @@ interface InspectorDrawerProps {
   models: ModelsConfig | null;
   dataPolicy: DataPolicyConfig | null;
   onUpdateRole: (role: string, profile: string) => Promise<void>;
+  onUpsertProfile: (payload: ModelProfileUpsertPayload) => Promise<void>;
+  onDeleteProfile: (profileName: string) => Promise<void>;
   onUpdateDataPolicy: (patch: Partial<DataPolicyConfig>) => Promise<void>;
-  onOpenFullSettings: () => void;
   costs: CostsSummaryResponse | null;
   metrics: MetricsSummaryResponse | null;
   events: BlackboardEvent[];
 }
 
 const SECTION_TITLES: Record<InspectorSection, string> = {
-  decisions: "Decisions",
+  agents: "Agents",
+  keys: "API Keys & CLI",
   models: "Models & Policy",
+  decisions: "Decisions",
   costs: "Costs",
   outbox: "Activity Outbox",
 };
@@ -63,13 +136,32 @@ export function InspectorDrawer({
   section,
   onChangeSection,
   onClose,
+  activeRunId,
+  runAgents,
+  roster,
+  apiKeys,
+  catalog,
+  openAiSub,
+  keyModelsMap,
+  onCreateAgentSlot,
+  onUpdateAgentSlot,
+  onDeleteAgentSlot,
+  onAddRunAgent,
+  onRemoveRunAgent,
+  onUnlockVault,
+  onSaveApiKey,
+  onDeleteApiKey,
+  onFetchKeyModels,
+  onToggleOpenAiSub,
+  onTestConnection,
   decisions,
   onResolveDecision,
   models,
   dataPolicy,
   onUpdateRole,
+  onUpsertProfile,
+  onDeleteProfile,
   onUpdateDataPolicy,
-  onOpenFullSettings,
   costs,
   metrics,
   events,
@@ -78,33 +170,38 @@ export function InspectorDrawer({
   const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
 
   const pendingCount = decisions.filter((d) => d.status === "pending").length;
+  const enabledAgentCount = (roster?.agents ?? []).filter((a) => a.enabled).length;
+  const savedKeysCount = apiKeys?.keys.length ?? 0;
+
   const filteredEvents = useMemo(
     () => filterAndSortEvents(events, category, ""),
     [events, category]
   );
 
   const tabs: Array<{ key: InspectorSection; label: string }> = [
+    { key: "agents", label: enabledAgentCount > 0 ? `Agents (${enabledAgentCount})` : "Agents" },
+    { key: "keys", label: savedKeysCount > 0 ? `API Keys (${savedKeysCount})` : "API Keys" },
+    { key: "models", label: "Models" },
     {
       key: "decisions",
       label: pendingCount > 0 ? `Decisions (${pendingCount})` : "Decisions",
     },
-    { key: "models", label: "Models" },
     { key: "costs", label: "Costs" },
     { key: "outbox", label: "Outbox" },
   ];
 
   return (
     <aside
-      aria-label="Details split pane"
-      className="w-full lg:w-[440px] xl:w-[480px] shrink-0 border-t lg:border-t-0 lg:border-l flex flex-col h-full min-h-0"
+      aria-label="Control workbench sidebar"
+      className="w-full lg:w-[500px] xl:w-[560px] shrink-0 border-t lg:border-t-0 lg:border-l flex flex-col h-full min-h-0"
       style={{
         backgroundColor: "var(--bg-canvas)",
         borderColor: "var(--border-hairline)",
       }}
     >
-      <div className="px-6 pt-5 pb-3 shrink-0 space-y-3">
+      <div className="px-5 pt-5 pb-3 shrink-0 space-y-3">
         <div className="flex items-center justify-between gap-3">
-          <h2 className="font-serif text-[26px] font-medium tracking-tight text-[var(--ink-primary)]">
+          <h2 className="font-serif text-[25px] font-medium tracking-tight text-[var(--ink-primary)]">
             {SECTION_TITLES[section]}
           </h2>
           <button
@@ -124,7 +221,7 @@ export function InspectorDrawer({
         <div
           className="flex flex-wrap items-center gap-1.5"
           role="tablist"
-          aria-label="Inspector sections"
+          aria-label="Right sidebar sections"
         >
           {tabs.map((tab) => {
             const active = section === tab.key;
@@ -135,7 +232,7 @@ export function InspectorDrawer({
                 role="tab"
                 aria-selected={active}
                 onClick={() => onChangeSection(tab.key)}
-                className="h-8 px-3 rounded-full border text-[12.5px] transition-colors"
+                className="h-7 px-2.5 rounded-full border text-[12px] transition-colors"
                 style={
                   active
                     ? {
@@ -158,19 +255,61 @@ export function InspectorDrawer({
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-hidden px-2 pb-4" role="tabpanel">
-        {section === "decisions" && (
-          <DecisionsPanel decisions={decisions} onResolve={onResolveDecision} />
+      <div className="flex-1 min-h-0 overflow-hidden px-1 pb-4" role="tabpanel">
+        {section === "agents" && (
+          <AgentLayersStudio
+            compact
+            roster={roster}
+            models={models}
+            apiKeys={apiKeys}
+            catalog={catalog}
+            openAiSub={openAiSub}
+            keyModelsMap={keyModelsMap}
+            activeRunId={activeRunId}
+            runAgents={runAgents}
+            onCreateAgentSlot={onCreateAgentSlot}
+            onUpdateAgentSlot={onUpdateAgentSlot}
+            onDeleteAgentSlot={onDeleteAgentSlot}
+            onAddRunAgent={onAddRunAgent}
+            onRemoveRunAgent={onRemoveRunAgent}
+            onOpenApiKeys={() => onChangeSection("keys")}
+          />
+        )}
+
+        {section === "keys" && (
+          <ApiKeysPanel
+            apiKeys={apiKeys}
+            catalog={catalog}
+            openAiSub={openAiSub}
+            onUnlockVault={onUnlockVault}
+            onSaveApiKey={onSaveApiKey}
+            onDeleteApiKey={onDeleteApiKey}
+            onFetchKeyModels={onFetchKeyModels}
+            onToggleOpenAiSub={onToggleOpenAiSub}
+            onTestConnection={onTestConnection}
+            onOpenModels={() => onChangeSection("models")}
+          />
         )}
 
         {section === "models" && (
           <ModelSwitcherPanel
             models={models}
             dataPolicy={dataPolicy}
+            apiKeys={apiKeys}
+            catalog={catalog}
+            openAiSub={openAiSub}
+            keyModelsMap={keyModelsMap}
             onUpdateRole={onUpdateRole}
+            onUpsertProfile={onUpsertProfile}
+            onDeleteProfile={onDeleteProfile}
+            onFetchKeyModels={onFetchKeyModels}
             onUpdateDataPolicy={onUpdateDataPolicy}
-            onOpenFullSettings={onOpenFullSettings}
+            onOpenApiKeys={() => onChangeSection("keys")}
           />
+        )}
+
+        {section === "decisions" && (
+          <DecisionsPanel decisions={decisions} onResolve={onResolveDecision} />
         )}
 
         {section === "costs" && <CostsMetricsPanel costs={costs} metrics={metrics} />}

@@ -26,3 +26,4 @@ class DaemonState:
     preview_urls: dict[str, dict[str, str]] = field(default_factory=dict)
     default_local_preview_url: str = "http://127.0.0.1:5173"
     start_relay_in_lifespan: bool = False
+    vault_passphrase: str | None = None

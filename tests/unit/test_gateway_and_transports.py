@@ -33,6 +33,7 @@ from foundry.gateway import (
 from foundry.gateway.transports import (
     AnthropicTransport,
     GoogleGenAITransport,
+    OpenAICodexCliTransport,
     OpenAICompatibleTransport,
 )
 from foundry.security import CredentialVault, SecretLeakError
@@ -582,3 +583,184 @@ async def test_partitioned_sub_budgets_and_warn_threshold() -> None:
     await gw.complete(rev_req)  # costs 1.125 (>= 0.15 review cap)
     with pytest.raises(BudgetExceededError, match="task_review:t_1"):
         await gw.complete(rev_req)
+
+
+@pytest.mark.asyncio
+async def test_gateway_key_ref_override_passes_bound_key_to_transport() -> None:
+    seen_key_refs: list[str | None] = []
+
+    class _CaptureKeyStub:
+        name = "capture"
+
+        async def complete(
+            self,
+            provider_id: str,
+            provider_cfg: ProviderConfig,
+            model: str,
+            request: GatewayRequest,
+        ) -> GatewayResponse:
+            seen_key_refs.append(provider_cfg.key_ref)
+            return GatewayResponse(
+                provider_id=provider_id,
+                model=model,
+                transport=provider_cfg.transport,
+                billing_mode=provider_cfg.billing_mode,
+                content="ok",
+                tokens_in=10,
+                tokens_cached=0,
+                tokens_out=5,
+            )
+
+        async def health_check(self, provider_id: str, provider_cfg: ProviderConfig) -> Any:
+            return None
+
+    cfg = default_models_config()
+    stub = _CaptureKeyStub()
+    gw = ModelGateway(
+        cfg,
+        transports={
+            TransportKind.GOOGLE_GENAI: stub,
+            TransportKind.OPENAI_COMPAT: stub,
+            TransportKind.ANTHROPIC: stub,
+        },  # type: ignore[arg-type]
+    )
+    await gw.complete(
+        GatewayRequest(
+            role="implementer",
+            messages=[{"role": "user", "content": "use custom key"}],
+            key_ref_override="vault:var_api_key_1",
+        )
+    )
+    assert seen_key_refs == ["vault:var_api_key_1"]
+    assert cfg.providers["gemini_paid"].key_ref == "vault:gemini"
+
+
+@pytest.mark.asyncio
+async def test_openai_codex_cli_transport_opt_in_and_no_tools_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Disabled by default -> GatewayPolicyError
+    cfg = default_models_config()
+    assert cfg.policies.allow_openai_subscription_cli is False
+    stub_cli = _StubTransport()
+    gw_disabled = ModelGateway(
+        cfg,
+        transports={
+            TransportKind.GOOGLE_GENAI: stub_cli,
+            TransportKind.OPENAI_COMPAT: stub_cli,
+            TransportKind.ANTHROPIC: stub_cli,
+            TransportKind.OPENAI_CODEX_CLI: stub_cli,
+        },  # type: ignore[arg-type]
+    )
+    with pytest.raises(GatewayPolicyError, match="disabled"):
+        await gw_disabled.complete(
+            GatewayRequest(
+                role="orchestrator",
+                messages=[{"role": "user", "content": "hi"}],
+                provider_override="openai_subscription_cli",
+                model_override="gpt-5",
+            )
+        )
+
+    # Even when enabled, tools are strictly rejected (A7-2 single-shot non-tool invariant)
+    cfg.policies.allow_openai_subscription_cli = True
+    gw_enabled = ModelGateway(
+        cfg,
+        transports={
+            TransportKind.GOOGLE_GENAI: stub_cli,
+            TransportKind.OPENAI_COMPAT: stub_cli,
+            TransportKind.ANTHROPIC: stub_cli,
+            TransportKind.OPENAI_CODEX_CLI: stub_cli,
+        },  # type: ignore[arg-type]
+    )
+    with pytest.raises(GatewayPolicyError, match="does not support native tool calling"):
+        await gw_enabled.complete(
+            GatewayRequest(
+                role="orchestrator",
+                messages=[{"role": "user", "content": "use tools"}],
+                tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                provider_override="openai_subscription_cli",
+                model_override="gpt-5",
+            )
+        )
+
+    # Direct OpenAICodexCliTransport also refuses tool requests & runs `codex exec` via subprocess
+    transport = OpenAICodexCliTransport()
+    prov_cfg = cfg.providers["openai_subscription_cli"]
+    with pytest.raises(TransportError, match="single-shot non-tool only"):
+        await transport.complete(
+            "openai_subscription_cli",
+            prov_cfg,
+            "gpt-5",
+            GatewayRequest(
+                role="orchestrator",
+                messages=[{"role": "user", "content": "test"}],
+                tools=[{"type": "function", "function": {"name": "noop", "parameters": {}}}],
+            ),
+        )
+
+    captured_cmd: list[str] = []
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, stdin_bytes: bytes | None = None) -> tuple[bytes, bytes]:
+            assert stdin_bytes is not None
+            assert b"Hello subscription" in stdin_bytes
+            return b"OK from codex", b""
+
+    async def _fake_exec(*cmd: str, **_: Any) -> _FakeProc:
+        captured_cmd.extend(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/local/bin/{name}")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    resp = await transport.complete(
+        "openai_subscription_cli",
+        prov_cfg,
+        "gpt-5-codex",
+        GatewayRequest(
+            role="orchestrator",
+            messages=[{"role": "user", "content": "Hello subscription"}],
+        ),
+    )
+    assert resp.content == "OK from codex"
+    assert resp.transport == TransportKind.OPENAI_CODEX_CLI
+    assert captured_cmd[:6] == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "-m",
+    ]
+    assert captured_cmd[6] == "gpt-5-codex"
+    assert captured_cmd[7] == "-"
+
+
+@pytest.mark.asyncio
+async def test_gateway_provider_and_model_override_routes_directly() -> None:
+    cfg = default_models_config()
+    stub = _StubTransport()
+    gw = ModelGateway(
+        cfg,
+        transports={
+            TransportKind.GOOGLE_GENAI: stub,
+            TransportKind.OPENAI_COMPAT: stub,
+            TransportKind.ANTHROPIC: stub,
+            TransportKind.OPENAI_CODEX_CLI: stub,
+        },  # type: ignore[arg-type]
+    )
+    resp = await gw.complete(
+        GatewayRequest(
+            role="orchestrator",
+            messages=[{"role": "user", "content": "hello"}],
+            provider_override="openai_paid",
+            model_override="gpt-4.1-mini",
+            key_ref_override="vault:var_openai_key_1",
+        )
+    )
+    assert resp.provider_id == "openai_paid"
+    assert resp.model == "gpt-4.1-mini"
+    assert stub.calls == [("openai_paid", "gpt-4.1-mini")]

@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from foundry.config.schemas import (
+    ApiKeysRegistryConfig,
     BillingEnforcement,
     BillingMode,
     BudgetConfig,
@@ -32,6 +33,7 @@ from foundry.gateway.rate_limit import RateLimitRouter
 from foundry.gateway.transports import (
     AnthropicTransport,
     GoogleGenAITransport,
+    OpenAICodexCliTransport,
     OpenAICompatibleTransport,
 )
 from foundry.security.scanner import SecretScanner
@@ -223,6 +225,7 @@ class ModelGateway:
                 TransportKind.OPENAI_COMPAT: OpenAICompatibleTransport(self.vault),
                 TransportKind.GOOGLE_GENAI: GoogleGenAITransport(self.vault),
                 TransportKind.ANTHROPIC: AnthropicTransport(self.vault),
+                TransportKind.OPENAI_CODEX_CLI: OpenAICodexCliTransport(),
             }
         )
 
@@ -258,7 +261,29 @@ class ModelGateway:
         request: GatewayRequest,
     ) -> tuple[ModelProfile, ProviderConfig]:
         profile = self.models_cfg.profiles[profile_name]
-        provider_cfg = self.models_cfg.providers[profile.provider]
+        effective_provider_id = request.provider_override or profile.provider
+        if effective_provider_id not in self.models_cfg.providers:
+            raise GatewayPolicyError(
+                f"Resolved provider '{effective_provider_id}' does not exist in models config"
+            )
+        provider_cfg = self.models_cfg.providers[effective_provider_id]
+        if request.provider_override or request.model_override:
+            profile = profile.model_copy(
+                update={
+                    "provider": effective_provider_id,
+                    "model": request.model_override or profile.model,
+                    "family": provider_cfg.family or profile.family,
+                }
+            )
+
+        if (
+            provider_cfg.transport == TransportKind.OPENAI_CODEX_CLI
+            and not self.models_cfg.policies.allow_openai_subscription_cli
+        ):
+            raise GatewayPolicyError(
+                "OpenAI Subscription (Codex CLI) transport is disabled. "
+                "Enable opt-in single-shot subscription mode in API Keys first."
+            )
 
         is_free = (
             provider_cfg.billing_mode == BillingMode.FREE_TIER
@@ -302,16 +327,21 @@ class ModelGateway:
         compacted_messages = compact_tool_history(request.messages, keep_recent_steps=6)
         primary_profile = self.resolve_profile_name(request)
         # Validate primary assignment strictly before considering fallbacks
-        self._validate_candidate(primary_profile, request)
-        candidates = self.rate_router.candidate_profiles(primary_profile, self.models_cfg)
-
-        compliant: list[tuple[str, ModelProfile, ProviderConfig]] = []
-        for name in candidates:
-            try:
-                profile, provider_cfg = self._validate_candidate(name, request)
-                compliant.append((name, profile, provider_cfg))
-            except GatewayPolicyError:
-                continue
+        explicit_override = bool(request.provider_override or request.model_override)
+        primary_resolved_prof, primary_resolved_prov = self._validate_candidate(
+            primary_profile, request
+        )
+        if explicit_override:
+            compliant = [(primary_profile, primary_resolved_prof, primary_resolved_prov)]
+        else:
+            candidates = self.rate_router.candidate_profiles(primary_profile, self.models_cfg)
+            compliant = []
+            for name in candidates:
+                try:
+                    profile, provider_cfg = self._validate_candidate(name, request)
+                    compliant.append((name, profile, provider_cfg))
+                except GatewayPolicyError:
+                    continue
 
         primary_name, primary_prof, _ = compliant[0]
         prompt_hash = self.normalizer.compute_hash(
@@ -343,13 +373,20 @@ class ModelGateway:
         compacted_request = request.model_copy(update={"messages": compacted_messages})
         last_error: Exception | None = None
         for _, profile, provider_cfg in compliant:
-            transport = self.transports.get(provider_cfg.transport)
+            effective_provider_cfg = (
+                provider_cfg.model_copy(update={"key_ref": request.key_ref_override})
+                if request.key_ref_override
+                else provider_cfg
+            )
+            transport = self.transports.get(effective_provider_cfg.transport)
             if transport is None:
-                raise TransportError(f"No transport registered for {provider_cfg.transport}")
+                raise TransportError(
+                    f"No transport registered for {effective_provider_cfg.transport}"
+                )
             try:
                 response = await transport.complete(
                     profile.provider,
-                    provider_cfg,
+                    effective_provider_cfg,
                     profile.model,
                     compacted_request,
                 )
@@ -406,3 +443,17 @@ class ModelGateway:
             transport = self.transports[cfg.transport]
             results.append(await transport.health_check(provider_id, cfg))
         return results
+
+
+def resolve_api_key_ref(
+    api_key_var: str | None,
+    registry: ApiKeysRegistryConfig | None,
+) -> str | None:
+    """Resolve an agent's named API key variable (e.g. `API_KEY_1`) to its vault key_ref."""
+    if not api_key_var or registry is None:
+        return None
+    target = api_key_var.strip().upper()
+    for entry in registry.keys:
+        if entry.name == target:
+            return entry.key_ref
+    return None

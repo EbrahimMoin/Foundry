@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import shutil
 import subprocess
 import sys
@@ -1142,6 +1143,10 @@ def serve(
         Path,
         typer.Option(help="Built Dashboard v0.5 static dist directory"),
     ] = Path("dashboard/dist"),
+    passphrase: Annotated[
+        str | None,
+        typer.Option(help="Vault passphrase kept only in daemon RAM (or FOUNDRY_VAULT_PASSPHRASE)"),
+    ] = None,
 ) -> None:
     """Serve the Foundry Daemon HTTP API, WebSocket stream, and Dashboard v0.5."""
     import uvicorn
@@ -1169,6 +1174,7 @@ def serve(
         dashboard_dir=dashboard_dir if dashboard_dir.is_dir() else None,
         listen_dsn=listen_dsn,
         start_relay_in_lifespan=True,
+        vault_passphrase=passphrase or os.environ.get("FOUNDRY_VAULT_PASSPHRASE"),
     )
     fastapi_app = create_app(daemon_state)
     console.print(f"[green]Foundry Daemon listening at[/green] http://{bind_host}:{bind_port}")

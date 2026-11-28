@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 class TransportKind(StrEnum):
@@ -14,12 +16,14 @@ class TransportKind(StrEnum):
     OPENAI_COMPAT = "openai_compat"
     GOOGLE_GENAI = "google_genai"
     ANTHROPIC = "anthropic"
+    OPENAI_CODEX_CLI = "openai_codex_cli"
 
 
 class BillingMode(StrEnum):
     PAID_API = "paid_api"
     FREE_TIER = "free_tier"
     LOCAL = "local"
+    SUBSCRIPTION_CLI = "subscription_cli"
 
 
 class DataTier(StrEnum):
@@ -108,6 +112,7 @@ class GatewayPolicyConfig(BaseModel):
     require_verifier_family_diversity: Literal["true", "warn", "false"] | bool = True
     upgrade_on_attempt: int = Field(default=2, ge=1)
     benchmark_pin_models: bool = False
+    allow_openai_subscription_cli: bool = False
 
 
 class ModelsConfig(BaseModel):
@@ -253,3 +258,122 @@ class ProjectConfig(BaseModel):
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
     deploy: DeployConfig = Field(default_factory=DeployConfig)
     git: GitConfig = Field(default_factory=GitConfig)
+
+
+AgentLayer = Literal[1, 2, 3]
+AgentRole = Literal[
+    "orchestrator",
+    "lead",
+    "implementer",
+    "test_writer",
+    "reviewer",
+    "integration",
+    "release",
+]
+
+_KEY_VAR_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+LAYER_ALLOWED_ROLES: dict[int, set[str]] = {
+    1: {"orchestrator"},
+    2: {"lead"},
+    3: {"implementer", "test_writer", "reviewer", "integration", "release"},
+}
+
+
+def normalize_api_key_var_name(raw: str) -> str:
+    """Normalize user input like `'api key 1'` to `'API_KEY_1'`."""
+    cleaned = re.sub(r"[\s\-]+", "_", raw.strip()).upper()
+    if not _KEY_VAR_PATTERN.match(cleaned):
+        raise ValueError(
+            "API key variable name must start with A-Z and contain only A-Z, 0-9, or _"
+        )
+    return cleaned
+
+
+AgentAuthSource = Literal["profile_default", "api_key", "openai_subscription"]
+
+
+class ApiKeyEntry(BaseModel):
+    """Non-secret metadata for a named API key stored inside CredentialVault."""
+
+    name: str
+    provider: str = Field(
+        default="custom",
+        validation_alias=AliasChoices("provider", "provider_hint"),
+    )
+    key_ref: str
+    masked_preview: str
+    backend: Literal["keyring", "encrypted_vault"] = "encrypted_vault"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def provider_hint(self) -> str:
+        """Backward-compatible alias returning the normalized provider key."""
+        return self.provider
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        return normalize_api_key_var_name(value)
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        return cleaned or "custom"
+
+
+class ApiKeysRegistryConfig(BaseModel):
+    """Persisted `api_keys.yaml` registry (metadata & vault references only)."""
+
+    keys: list[ApiKeyEntry] = Field(default_factory=list)
+
+
+class AgentSlotConfig(BaseModel):
+    """Single agent slot inside Foundry's configurable 3-layer agent hierarchy."""
+
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=80)
+    layer: AgentLayer
+    role: AgentRole
+    domain: str | None = None
+    parent_id: str | None = None
+    model_profile: str = "@coder"
+    auth_source: AgentAuthSource = "profile_default"
+    api_key_var: str | None = None
+    model_name: str | None = None
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _validate_slot(self) -> AgentSlotConfig:
+        prof = self.model_profile.strip()
+        if prof:
+            self.model_profile = f"@{prof.lstrip('@')}"
+        allowed = LAYER_ALLOWED_ROLES[int(self.layer)]
+        if self.role not in allowed:
+            raise ValueError(
+                f"Layer {self.layer} only allows roles {sorted(allowed)}, got '{self.role}'"
+            )
+        if self.api_key_var is not None and self.api_key_var.strip():
+            self.api_key_var = normalize_api_key_var_name(self.api_key_var)
+            if self.auth_source == "profile_default":
+                self.auth_source = "api_key"
+        else:
+            self.api_key_var = None
+        if self.auth_source in {"openai_subscription", "profile_default"}:
+            self.api_key_var = None
+        if self.model_name is not None and not self.model_name.strip():
+            self.model_name = None
+        elif self.model_name is not None:
+            self.model_name = self.model_name.strip()
+        if self.domain is not None and not self.domain.strip():
+            self.domain = None
+        elif self.domain is not None:
+            self.domain = self.domain.strip()
+        return self
+
+
+class AgentRosterConfig(BaseModel):
+    """Persisted 3-layer Foundry agent hierarchy (`agents.yaml`)."""
+
+    agents: list[AgentSlotConfig] = Field(default_factory=list)

@@ -1,14 +1,21 @@
 import { useState } from "react";
 import { ArrowRight, CheckCircle2, Circle, Lock } from "lucide-react";
-import { AgentsPanel } from "./AgentsPanel";
+import { AgentLayersStudio } from "./AgentLayersStudio";
 import { ContractsPanel } from "./ContractsPanel";
 import { PreviewPanel } from "./PreviewPanel";
 import { TasksPanel } from "./TasksPanel";
 import type {
+  AgentAuthSource,
+  AgentLayer,
   AgentRecord,
+  AgentRole,
+  AgentRosterConfig,
+  ApiKeysStatusResponse,
   ContractRecord,
   DecisionRecord,
   ModelsConfig,
+  OpenAISubscriptionStatus,
+  ProviderCatalogEntry,
   TaskRecord,
   WriteReservationRecord,
 } from "../types";
@@ -24,6 +31,47 @@ interface WorkspaceHubProps {
   agents: AgentRecord[];
   decisions: DecisionRecord[];
   models: ModelsConfig | null;
+  roster: AgentRosterConfig | null;
+  apiKeys: ApiKeysStatusResponse | null;
+  catalog: ProviderCatalogEntry[];
+  openAiSub: OpenAISubscriptionStatus | null;
+  keyModelsMap: Record<string, string[]>;
+  onCreateAgentSlot: (payload: {
+    name: string;
+    layer: AgentLayer;
+    role: AgentRole;
+    domain?: string | null;
+    parent_id?: string | null;
+    model_profile: string;
+    auth_source?: AgentAuthSource;
+    api_key_var?: string | null;
+    model_name?: string | null;
+    enabled?: boolean;
+  }) => Promise<void>;
+  onUpdateAgentSlot: (
+    agentId: string,
+    payload: {
+      model_profile?: string;
+      auth_source?: AgentAuthSource;
+      api_key_var?: string | null;
+      model_name?: string | null;
+      clear_api_key?: boolean;
+      clear_model_name?: boolean;
+      enabled?: boolean;
+    }
+  ) => Promise<void>;
+  onDeleteAgentSlot: (agentId: string) => Promise<void>;
+  onAddRunAgent: (
+    runId: string,
+    payload: {
+      role: AgentRole;
+      domain?: string | null;
+      parent_agent_id?: string | null;
+      model_profile: string;
+    }
+  ) => Promise<void>;
+  onRemoveRunAgent: (runId: string, agentId: string) => Promise<void>;
+  onOpenApiKeys: () => void;
   onOpenDecisions: () => void;
   onAnnounce: (msg: string) => void;
 }
@@ -37,6 +85,17 @@ export function WorkspaceHub({
   agents,
   decisions,
   models,
+  roster,
+  apiKeys,
+  catalog,
+  openAiSub,
+  keyModelsMap,
+  onCreateAgentSlot,
+  onUpdateAgentSlot,
+  onDeleteAgentSlot,
+  onAddRunAgent,
+  onRemoveRunAgent,
+  onOpenApiKeys,
   onOpenDecisions,
   onAnnounce,
 }: WorkspaceHubProps) {
@@ -45,12 +104,16 @@ export function WorkspaceHub({
   const pendingDecisions = decisions.filter((d) => d.status === "pending");
   const wave2Tasks = tasks.filter((t) => t.wave === 2);
   const previewTasks = wave2Tasks.length > 0 ? wave2Tasks : tasks;
+  const activeRunAgentCount = agents.filter((a) => a.status !== "removed").length;
 
   const pills: Array<{ key: WorkspaceTab; label: string }> = [
     { key: "overview", label: "Top" },
     { key: "tasks", label: `Tasks (${tasks.length})` },
     { key: "contracts", label: `Contracts (${contracts.length})` },
-    { key: "agents", label: `Agents (${agents.length})` },
+    {
+      key: "agents",
+      label: `Agents (${roster?.agents.filter((a) => a.enabled).length ?? activeRunAgentCount})`,
+    },
     { key: "preview", label: "Preview" },
   ];
 
@@ -298,7 +361,22 @@ export function WorkspaceHub({
               <ContractsPanel contracts={contracts} onAnnounce={onAnnounce} />
             )}
             {tab === "agents" && (
-              <AgentsPanel agents={agents} models={models} onAnnounce={onAnnounce} />
+              <AgentLayersStudio
+                roster={roster}
+                models={models}
+                apiKeys={apiKeys}
+                catalog={catalog}
+                openAiSub={openAiSub}
+                keyModelsMap={keyModelsMap}
+                activeRunId={runId}
+                runAgents={agents}
+                onCreateAgentSlot={onCreateAgentSlot}
+                onUpdateAgentSlot={onUpdateAgentSlot}
+                onDeleteAgentSlot={onDeleteAgentSlot}
+                onAddRunAgent={onAddRunAgent}
+                onRemoveRunAgent={onRemoveRunAgent}
+                onOpenApiKeys={onOpenApiKeys}
+              />
             )}
             {tab === "preview" && <PreviewPanel runId={runId} />}
           </div>

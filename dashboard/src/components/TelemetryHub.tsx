@@ -1,77 +1,38 @@
-import { useState } from "react";
+import { Bot } from "lucide-react";
 import { CostsMetricsPanel } from "./CostsMetricsPanel";
-import { ModelSwitcherPanel } from "./ModelSwitcherPanel";
-import type {
-  CostsSummaryResponse,
-  DataPolicyConfig,
-  MetricsSummaryResponse,
-  ModelsConfig,
-} from "../types";
+import type { CostsSummaryResponse, MetricsSummaryResponse } from "../types";
 
 interface TelemetryHubProps {
-  models: ModelsConfig | null;
-  dataPolicy: DataPolicyConfig | null;
   costs: CostsSummaryResponse | null;
   metrics: MetricsSummaryResponse | null;
-  onUpdateRole: (role: string, profile: string) => Promise<void>;
-  onUpdateDataPolicy: (patch: Partial<DataPolicyConfig>) => Promise<void>;
-  onOpenFullSettings: () => void;
+  onOpenModelsDrawer: () => void;
 }
 
 export function TelemetryHub({
-  models,
-  dataPolicy,
   costs,
   metrics,
-  onUpdateRole,
-  onUpdateDataPolicy,
-  onOpenFullSettings,
+  onOpenModelsDrawer,
 }: TelemetryHubProps) {
-  const [tab, setTab] = useState<"costs" | "models">("costs");
-
   return (
     <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
       <div className="shrink-0 px-6 sm:px-10 pt-8 pb-4">
-        <div className="max-w-[660px] mx-auto">
+        <div className="max-w-[660px] mx-auto flex flex-wrap items-center justify-between gap-3">
           <h1 className="font-serif text-[32px] font-medium tracking-tight text-[var(--ink-primary)]">
             Telemetry
           </h1>
-          <div className="mt-4 flex items-center gap-2" role="tablist">
-            {(
-              [
-                { key: "costs", label: "Costs & Health" },
-                { key: "models", label: "Models & Policy" },
-              ] as const
-            ).map((item) => {
-              const active = tab === item.key;
-              return (
-                <button
-                  key={item.key}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => setTab(item.key)}
-                  className="h-9 px-4 rounded-full border text-[13.5px] transition-colors"
-                  style={
-                    active
-                      ? {
-                          backgroundColor: "var(--bg-active)",
-                          borderColor: "transparent",
-                          color: "var(--ink-primary)",
-                          fontWeight: 500,
-                        }
-                      : {
-                          backgroundColor: "var(--bg-surface)",
-                          borderColor: "var(--border-hairline)",
-                          color: "var(--ink-secondary)",
-                        }
-                  }
-                >
-                  {item.label}
-                </button>
-              );
-            })}
-          </div>
+          <button
+            type="button"
+            onClick={onOpenModelsDrawer}
+            className="h-9 px-3.5 rounded-full border inline-flex items-center gap-1.5 text-[12.5px] font-medium hover:bg-[var(--bg-hover)]"
+            style={{
+              backgroundColor: "var(--bg-surface)",
+              borderColor: "var(--border-hairline)",
+              color: "var(--ink-primary)",
+            }}
+          >
+            <Bot className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
+            Edit Models in Right Sidebar
+          </button>
         </div>
       </div>
 
@@ -83,17 +44,7 @@ export function TelemetryHub({
             borderColor: "var(--border-hairline)",
           }}
         >
-          {tab === "costs" ? (
-            <CostsMetricsPanel costs={costs} metrics={metrics} />
-          ) : (
-            <ModelSwitcherPanel
-              models={models}
-              dataPolicy={dataPolicy}
-              onUpdateRole={onUpdateRole}
-              onUpdateDataPolicy={onUpdateDataPolicy}
-              onOpenFullSettings={onOpenFullSettings}
-            />
-          )}
+          <CostsMetricsPanel costs={costs} metrics={metrics} />
         </div>
       </div>
     </div>

@@ -8,6 +8,9 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from foundry.config.schemas import (
+    AgentRosterConfig,
+    AgentSlotConfig,
+    ApiKeysRegistryConfig,
     AssignmentConfig,
     BillingMode,
     DataTier,
@@ -103,6 +106,13 @@ def default_models_config() -> ModelsConfig:
             family="local",
             data_tier=DataTier.LOCAL,
         ),
+        "openai_subscription_cli": ProviderConfig(
+            transport=TransportKind.OPENAI_CODEX_CLI,
+            billing_mode=BillingMode.SUBSCRIPTION_CLI,
+            family="openai",
+            data_tier=DataTier.PAID,
+            supports_tool_calling=False,
+        ),
     }
 
     profiles = {
@@ -118,6 +128,12 @@ def default_models_config() -> ModelsConfig:
             model="gpt-5",
             family="openai",
             price=TokenPrice(**{"in": 2.00, "cached_in": 0.50, "out": 8.00}),
+        ),
+        "@openai_subscription": ModelProfile(
+            provider="openai_subscription_cli",
+            model="gpt-5",
+            family="openai",
+            price=TokenPrice(**{"in": 0.0, "cached_in": 0.0, "out": 0.0}),
         ),
         "@lead": ModelProfile(
             provider="gemini_paid",
@@ -197,6 +213,81 @@ def default_project_config(name: str = "app") -> ProjectConfig:
     return ProjectConfig(name=name)
 
 
+def default_api_keys_registry() -> ApiKeysRegistryConfig:
+    return ApiKeysRegistryConfig(keys=[])
+
+
+def default_agent_roster_config() -> AgentRosterConfig:
+    """Return Foundry's default 3-layer agent hierarchy (Orchestrator -> Leads -> Workers)."""
+    return AgentRosterConfig(
+        agents=[
+            AgentSlotConfig(
+                id="orch_primary",
+                name="Project Orchestrator",
+                layer=1,
+                role="orchestrator",
+                domain=None,
+                parent_id=None,
+                model_profile="@planner",
+            ),
+            AgentSlotConfig(
+                id="lead_backend",
+                name="Backend Lead",
+                layer=2,
+                role="lead",
+                domain="backend",
+                parent_id="orch_primary",
+                model_profile="@lead",
+            ),
+            AgentSlotConfig(
+                id="lead_frontend",
+                name="Frontend Lead",
+                layer=2,
+                role="lead",
+                domain="frontend",
+                parent_id="orch_primary",
+                model_profile="@lead",
+            ),
+            AgentSlotConfig(
+                id="impl_backend",
+                name="Backend Implementer",
+                layer=3,
+                role="implementer",
+                domain="backend",
+                parent_id="lead_backend",
+                model_profile="@coder",
+            ),
+            AgentSlotConfig(
+                id="impl_frontend",
+                name="Frontend Implementer",
+                layer=3,
+                role="implementer",
+                domain="frontend",
+                parent_id="lead_frontend",
+                model_profile="@coder",
+            ),
+            AgentSlotConfig(
+                id="g3_verifier",
+                name="G3 Black-Box Test Writer",
+                layer=3,
+                role="test_writer",
+                domain="backend",
+                parent_id="lead_backend",
+                model_profile="@verifier",
+            ),
+            AgentSlotConfig(
+                id="g4_reviewer",
+                name="G4 Cross-Family Reviewer",
+                layer=3,
+                role="reviewer",
+                domain="frontend",
+                parent_id="lead_frontend",
+                model_profile="@verifier",
+            ),
+        ]
+    )
+
+
 def _load_yaml_model[TModel: BaseModel](path: Path, model_cls: type[TModel]) -> TModel:
     if not path.exists():
         raise ConfigError(f"Configuration file not found: {path}")
@@ -234,6 +325,34 @@ def load_models_config(path: Path | None = None) -> ModelsConfig:
     return _load_yaml_model(target, ModelsConfig)
 
 
+def ensure_subscription_provider(cfg: ModelsConfig) -> ModelsConfig:
+    """Ensure `openai_subscription_cli` provider exists on older `models.yaml` files."""
+    if "openai_subscription_cli" in cfg.providers:
+        return cfg
+    updated_providers = dict(cfg.providers)
+    updated_providers["openai_subscription_cli"] = ProviderConfig(
+        transport=TransportKind.OPENAI_CODEX_CLI,
+        billing_mode=BillingMode.SUBSCRIPTION_CLI,
+        family="openai",
+        data_tier=DataTier.PAID,
+        supports_tool_calling=False,
+    )
+    updated_profiles = dict(cfg.profiles)
+    if "@openai_subscription" not in updated_profiles:
+        updated_profiles["@openai_subscription"] = ModelProfile(
+            provider="openai_subscription_cli",
+            model="gpt-5",
+            family="openai",
+            price=TokenPrice(**{"in": 0.0, "cached_in": 0.0, "out": 0.0}),
+        )
+    return ModelsConfig(
+        providers=updated_providers,
+        profiles=updated_profiles,
+        assignments=cfg.assignments,
+        policies=cfg.policies,
+    )
+
+
 def save_models_config(config: ModelsConfig, path: Path | None = None) -> Path:
     target = path or (CONFIG_DIR_DEFAULT / "models.yaml")
     _save_yaml_model(target, config)
@@ -247,5 +366,27 @@ def load_project_config(path: Path | None = None) -> ProjectConfig:
 
 def save_project_config(config: ProjectConfig, path: Path | None = None) -> Path:
     target = path or (Path.cwd() / ".foundry" / "project.yaml")
+    _save_yaml_model(target, config)
+    return target
+
+
+def load_api_keys_registry(path: Path | None = None) -> ApiKeysRegistryConfig:
+    target = path or (CONFIG_DIR_DEFAULT / "api_keys.yaml")
+    return _load_yaml_model(target, ApiKeysRegistryConfig)
+
+
+def save_api_keys_registry(config: ApiKeysRegistryConfig, path: Path | None = None) -> Path:
+    target = path or (CONFIG_DIR_DEFAULT / "api_keys.yaml")
+    _save_yaml_model(target, config)
+    return target
+
+
+def load_agent_roster_config(path: Path | None = None) -> AgentRosterConfig:
+    target = path or (CONFIG_DIR_DEFAULT / "agents.yaml")
+    return _load_yaml_model(target, AgentRosterConfig)
+
+
+def save_agent_roster_config(config: AgentRosterConfig, path: Path | None = None) -> Path:
+    target = path or (CONFIG_DIR_DEFAULT / "agents.yaml")
     _save_yaml_model(target, config)
     return target

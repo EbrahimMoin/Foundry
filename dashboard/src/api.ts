@@ -1,16 +1,22 @@
 import {
+  DEFAULT_PROVIDER_CATALOG,
   INITIAL_MOCK_AGENTS,
   INITIAL_MOCK_AUTONOMY,
+  INITIAL_MOCK_CHATS,
   INITIAL_MOCK_CONTRACTS,
   INITIAL_MOCK_COSTS,
   INITIAL_MOCK_DATA_POLICY,
   INITIAL_MOCK_DECISIONS,
   INITIAL_MOCK_EVENTS,
+  INITIAL_MOCK_KEYS,
+  INITIAL_MOCK_MESSAGES,
   INITIAL_MOCK_METRICS,
   INITIAL_MOCK_MODELS,
   INITIAL_MOCK_NOTES,
+  INITIAL_MOCK_OPENAI_SUBSCRIPTION,
   INITIAL_MOCK_PREVIEWS,
   INITIAL_MOCK_RESERVATIONS,
+  INITIAL_MOCK_ROSTER,
   INITIAL_MOCK_RUNS,
   INITIAL_MOCK_RUNTIME_SETTINGS,
   MOCK_CONTRACT_VERSIONS,
@@ -20,24 +26,41 @@ import {
   PRIMARY_RUN_ID,
 } from "./mockData";
 import type {
+  AgentAuthSource,
+  AgentLayer,
   AgentRecord,
+  AgentRole,
+  AgentRosterConfig,
+  AgentSlotConfig,
+  ApiKeyPublicRecord,
+  ApiKeysStatusResponse,
   AutonomyConfig,
   AutonomyOverrides,
   BlackboardEvent,
+  ChatRunCreatedResponse,
+  ChatSessionSummary,
   ContractRecord,
   ContractVersionsResponse,
   CostsSummaryResponse,
   DataPolicyConfig,
   DecisionRecord,
+  KeyModelsResponse,
+  MessageRecord,
   MetricsSummaryResponse,
+  ModelProfileUpsertPayload,
   ModelsConfig,
   NoteRecord,
+  OpenAISubscriptionStatus,
   PreviewUrlResponse,
   ProjectSummary,
+  ProviderCatalogEntry,
+  ProviderCatalogResponse,
+  PurgeTestRunsResponse,
   RunRecord,
   RuntimeSettingsResponse,
   TaskDetailResponse,
   TaskRecord,
+  TestConnectionResponse,
   WriteReservationRecord,
 } from "./types";
 import { normalizeProfileKey } from "./utils/foundryMetrics";
@@ -55,6 +78,10 @@ class MockFoundryStore {
   contracts: Record<string, ContractRecord[]> = structuredClone(INITIAL_MOCK_CONTRACTS);
   decisions: Record<string, DecisionRecord[]> = structuredClone(INITIAL_MOCK_DECISIONS);
   notes: Record<string, NoteRecord[]> = structuredClone(INITIAL_MOCK_NOTES);
+  chats: ChatSessionSummary[] = structuredClone(INITIAL_MOCK_CHATS);
+  messages: Record<string, MessageRecord[]> = structuredClone(INITIAL_MOCK_MESSAGES);
+  roster: AgentRosterConfig = structuredClone(INITIAL_MOCK_ROSTER);
+  keysStatus: ApiKeysStatusResponse = structuredClone(INITIAL_MOCK_KEYS);
   costs: Record<string, CostsSummaryResponse> = structuredClone(INITIAL_MOCK_COSTS);
   metrics: Record<string, MetricsSummaryResponse> = structuredClone(INITIAL_MOCK_METRICS);
   models: ModelsConfig = structuredClone(INITIAL_MOCK_MODELS);
@@ -63,6 +90,8 @@ class MockFoundryStore {
   runtimeSettings: RuntimeSettingsResponse = structuredClone(INITIAL_MOCK_RUNTIME_SETTINGS);
   events: Record<string, BlackboardEvent[]> = structuredClone(INITIAL_MOCK_EVENTS);
   previews = structuredClone(INITIAL_MOCK_PREVIEWS);
+  catalog: ProviderCatalogEntry[] = structuredClone(DEFAULT_PROVIDER_CATALOG);
+  openAiSub: OpenAISubscriptionStatus = structuredClone(INITIAL_MOCK_OPENAI_SUBSCRIPTION);
 
   private listeners = new Map<string, Set<(ev: BlackboardEvent) => void>>();
 
@@ -233,6 +262,189 @@ export const api = {
 
   listRuns: () => request<RunRecord[]>("/api/runs", undefined, () => mockStore.runs),
 
+  listChats: () =>
+    request<ChatSessionSummary[]>("/api/chats", undefined, () => {
+      const assignedRefresh = mockStore.chats.map((c) => ({
+        ...c,
+        message_count: (mockStore.messages[c.run_id] ?? []).length,
+        agent_count: (mockStore.agents[c.run_id] ?? []).length,
+      }));
+      return assignedRefresh;
+    }),
+
+  createRun: (payload: {
+    prompt: string;
+    title?: string;
+    project_id?: string;
+    autonomy_preset?: AutonomyConfig["preset"];
+    budget_usd?: number;
+  }) =>
+    request<ChatRunCreatedResponse>(
+      "/api/runs",
+      { method: "POST", body: JSON.stringify(payload) },
+      () => {
+        const runId = `run_${Date.now()}`;
+        const now = new Date().toISOString();
+        const projectId = payload.project_id?.trim() || "app";
+        const firstLine = payload.prompt.trim().split(/\r?\n/)[0] || "New run";
+        const title =
+          payload.title?.trim() ||
+          (firstLine.length > 56 ? `${firstLine.slice(0, 56)}…` : firstLine);
+        const run: RunRecord = {
+          id: runId,
+          project_id: projectId,
+          phase: "planning",
+          budget_usd: payload.budget_usd ?? 5.0,
+          spent_usd: 0,
+          data_policy: { ...mockStore.dataPolicy },
+          started_at: now,
+          ended_at: null,
+        };
+        const threadId = `chat_${runId}`;
+        const enabled = mockStore.roster.agents.filter((a) => a.enabled);
+        const agents: AgentRecord[] = enabled.map((slot, idx) => ({
+          id: `agt_${runId}_${idx}`,
+          run_id: runId,
+          role: slot.role,
+          domain: slot.domain,
+          parent_agent_id: null,
+          model_profile: slot.model_profile,
+          status: "idle",
+          graph_thread_id: `${runId}:layer${slot.layer}:${slot.id}`,
+        }));
+        const msgs: MessageRecord[] = [
+          {
+            id: `msg_${Date.now()}_1`,
+            thread_id: threadId,
+            from_id: "human",
+            to_id: "orchestrator",
+            body: payload.prompt.trim(),
+            created_at: now,
+          },
+          {
+            id: `msg_${Date.now()}_2`,
+            thread_id: threadId,
+            from_id: "orchestrator",
+            to_id: "human",
+            body: `Initialized run ${runId} for ${projectId} with ${agents.length} configured 3-layer agents. Ready for planning.`,
+            created_at: now,
+          },
+        ];
+        const summary: ChatSessionSummary = {
+          run_id: runId,
+          title,
+          project_id: projectId,
+          phase: "planning",
+          message_count: msgs.length,
+          agent_count: agents.length,
+          is_chat_session: true,
+          started_at: now,
+          ended_at: null,
+        };
+        mockStore.runs = [run, ...mockStore.runs];
+        mockStore.chats = [summary, ...mockStore.chats];
+        mockStore.messages[runId] = msgs;
+        mockStore.agents[runId] = agents;
+        mockStore.tasks[runId] = [];
+        mockStore.reservations[runId] = [];
+        mockStore.contracts[runId] = [];
+        mockStore.decisions[runId] = [];
+        mockStore.notes[runId] = [];
+        mockStore.recomputeMetrics(runId);
+        return { run, chat: summary, messages: msgs, agents };
+      }
+    ),
+
+  listMessages: (runId: string) =>
+    request<MessageRecord[]>(
+      `/api/runs/${runId}/messages`,
+      undefined,
+      () => mockStore.messages[runId] ?? []
+    ),
+
+  postMessage: (
+    runId: string,
+    body: string,
+    fromId: "human" | "orchestrator" = "human",
+    invokeOrchestrator = false
+  ) =>
+    request<MessageRecord>(
+      `/api/runs/${runId}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          body,
+          from_id: fromId,
+          invoke_orchestrator: invokeOrchestrator,
+        }),
+      },
+      () => {
+        const msg: MessageRecord = {
+          id: `msg_${Date.now()}`,
+          thread_id: `chat_${runId}`,
+          from_id: fromId,
+          to_id: fromId === "human" ? "orchestrator" : "human",
+          body,
+          created_at: new Date().toISOString(),
+        };
+        mockStore.messages[runId] = [...(mockStore.messages[runId] ?? []), msg];
+        mockStore.emitEvent(runId, "chat.message_posted", msg.id, {
+          message_id: msg.id,
+          from_id: msg.from_id,
+          body: msg.body,
+        });
+        if (invokeOrchestrator && fromId === "human") {
+          const reply: MessageRecord = {
+            id: `msg_${Date.now()}_reply`,
+            thread_id: `chat_${runId}`,
+            from_id: "orchestrator",
+            to_id: "human",
+            body: `[Demo preview] Orchestrator received: "${body.slice(0, 80)}". Connect the live daemon to call your configured model.`,
+            created_at: new Date().toISOString(),
+          };
+          mockStore.messages[runId] = [...(mockStore.messages[runId] ?? []), reply];
+          mockStore.emitEvent(runId, "chat.message_posted", reply.id, {
+            message_id: reply.id,
+            from_id: "orchestrator",
+            body: reply.body,
+          });
+        }
+        return msg;
+      }
+    ),
+
+  deleteRun: (runId: string) =>
+    request<{ deleted: string }>(
+      `/api/runs/${runId}`,
+      { method: "DELETE" },
+      () => {
+        mockStore.runs = mockStore.runs.filter((r) => r.id !== runId);
+        mockStore.chats = mockStore.chats.filter((c) => c.run_id !== runId);
+        delete mockStore.agents[runId];
+        delete mockStore.tasks[runId];
+        delete mockStore.reservations[runId];
+        delete mockStore.contracts[runId];
+        delete mockStore.decisions[runId];
+        delete mockStore.messages[runId];
+        delete mockStore.notes[runId];
+        delete mockStore.events[runId];
+        return { deleted: runId };
+      }
+    ),
+
+  purgeTestRuns: () =>
+    request<PurgeTestRunsResponse>(
+      "/api/chats/purge-test-runs",
+      { method: "POST" },
+      () => {
+        const nonChatIds = mockStore.chats.filter((c) => !c.is_chat_session).map((c) => c.run_id);
+        const dropSet = new Set(nonChatIds);
+        mockStore.runs = mockStore.runs.filter((r) => !dropSet.has(r.id));
+        mockStore.chats = mockStore.chats.filter((c) => c.is_chat_session);
+        return { deleted_count: nonChatIds.length, deleted_run_ids: nonChatIds };
+      }
+    ),
+
   pauseRun: (runId: string) =>
     request<{ run_id: string; phase: string }>(
       `/api/runs/${runId}/pause`,
@@ -288,6 +500,54 @@ export const api = {
       `/api/runs/${runId}/agents`,
       undefined,
       () => mockStore.agents[runId] ?? []
+    ),
+
+  addRunAgent: (
+    runId: string,
+    payload: {
+      role: AgentRole;
+      domain?: string | null;
+      parent_agent_id?: string | null;
+      model_profile: string;
+    }
+  ) =>
+    request<AgentRecord>(
+      `/api/runs/${runId}/agents`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
+          model_profile: normalizeProfileKey(payload.model_profile),
+        }),
+      },
+      () => {
+        const agt: AgentRecord = {
+          id: `agt_${Date.now()}`,
+          run_id: runId,
+          role: payload.role,
+          domain: payload.domain ?? null,
+          parent_agent_id: payload.parent_agent_id ?? null,
+          model_profile: normalizeProfileKey(payload.model_profile),
+          status: "idle",
+          graph_thread_id: `${runId}:agent:${Date.now()}`,
+        };
+        mockStore.agents[runId] = [...(mockStore.agents[runId] ?? []), agt];
+        return agt;
+      }
+    ),
+
+  removeRunAgent: (runId: string, agentId: string) =>
+    request<AgentRecord>(
+      `/api/runs/${runId}/agents/${agentId}`,
+      { method: "DELETE" },
+      () => {
+        const list = mockStore.agents[runId] ?? [];
+        const updated = list.map((a) =>
+          a.id === agentId ? { ...a, status: "removed" } : a
+        );
+        mockStore.agents[runId] = updated;
+        return updated.find((a) => a.id === agentId)!;
+      }
     ),
 
   listTasks: (runId: string) =>
@@ -525,6 +785,344 @@ export const api = {
       "/api/settings/runtime",
       undefined,
       () => mockStore.runtimeSettings
+    ),
+
+  getApiKeys: () =>
+    request<ApiKeysStatusResponse>("/api/settings/keys", undefined, () => {
+      const keys = mockStore.keysStatus.keys.map((k) => ({
+        ...k,
+        assigned_agents: mockStore.roster.agents
+          .filter((a) => a.api_key_var === k.name)
+          .map((a) => a.name),
+      }));
+      return { ...mockStore.keysStatus, keys };
+    }),
+
+  unlockVault: (passphrase: string) =>
+    request<ApiKeysStatusResponse>(
+      "/api/settings/vault/unlock",
+      { method: "POST", body: JSON.stringify({ passphrase }) },
+      () => {
+        mockStore.keysStatus.vault_unlocked = true;
+        return mockStore.keysStatus;
+      }
+    ),
+
+  getProviderCatalog: () =>
+    request<ProviderCatalogResponse>(
+      "/api/settings/catalog",
+      undefined,
+      () => ({ providers: mockStore.catalog })
+    ),
+
+  saveApiKey: (payload: {
+    name: string;
+    secret: string;
+    provider: string;
+    passphrase?: string;
+  }) =>
+    request<ApiKeyPublicRecord>(
+      "/api/settings/keys",
+      { method: "POST", body: JSON.stringify(payload) },
+      () => {
+        const normName = payload.name.trim().replace(/[\s-]+/g, "_").toUpperCase();
+        const s = payload.secret.trim();
+        const masked = s.length >= 10 ? `${s.slice(0, 3)}••••${s.slice(-4)}` : "••••";
+        const cat = mockStore.catalog.find((p) => p.id === payload.provider);
+        const rec: ApiKeyPublicRecord = {
+          name: normName,
+          provider: payload.provider,
+          provider_label: cat?.label ?? payload.provider,
+          key_ref: `vault:var_${normName.toLowerCase()}`,
+          masked_preview: masked,
+          backend: "encrypted_vault",
+          assigned_agents: mockStore.roster.agents
+            .filter((a) => a.api_key_var === normName)
+            .map((a) => a.name),
+          created_at: new Date().toISOString(),
+        };
+        mockStore.keysStatus.keys = [
+          ...mockStore.keysStatus.keys.filter((k) => k.name !== normName),
+          rec,
+        ].sort((a, b) => a.name.localeCompare(b.name));
+        mockStore.keysStatus.vault_unlocked = true;
+        return rec;
+      }
+    ),
+
+  fetchKeyModels: (keyName: string) =>
+    request<KeyModelsResponse>(
+      `/api/settings/keys/${encodeURIComponent(keyName)}/models`,
+      { method: "POST" },
+      () => {
+        const entry = mockStore.keysStatus.keys.find((k) => k.name === keyName);
+        const cat = mockStore.catalog.find((p) => p.id === entry?.provider);
+        return {
+          key_name: keyName,
+          provider: entry?.provider ?? "custom",
+          provider_label: entry?.provider_label ?? "Custom",
+          models: cat?.models ?? [],
+          source: "catalog_fallback",
+          detail: "Demo catalog",
+        };
+      }
+    ),
+
+  upsertModelProfile: (payload: ModelProfileUpsertPayload) =>
+    request<ModelsConfig>(
+      "/api/settings/models/profiles",
+      { method: "PUT", body: JSON.stringify(payload) },
+      () => {
+        const norm = `@${payload.profile_name.trim().replace(/^@+/, "")}`;
+        let providerId = payload.provider ?? "gemini_paid";
+        let family = "custom";
+        if (payload.auth_source === "openai_subscription") {
+          providerId = "openai_subscription_cli";
+          family = "openai";
+        } else if (payload.auth_source === "api_key" && payload.api_key_var) {
+          const entry = mockStore.keysStatus.keys.find((k) => k.name === payload.api_key_var);
+          const cat = mockStore.catalog.find((c) => c.id === entry?.provider);
+          providerId = cat?.default_provider_id ?? "openai_paid";
+          family = cat?.family ?? entry?.provider ?? "custom";
+        } else if (payload.provider) {
+          const cat = mockStore.catalog.find(
+            (c) => c.id === payload.provider || c.default_provider_id === payload.provider
+          );
+          if (cat) {
+            providerId = cat.default_provider_id;
+            family = cat.family;
+          }
+        }
+        mockStore.models = {
+          ...mockStore.models,
+          profiles: {
+            ...mockStore.models.profiles,
+            [norm]: {
+              provider: providerId,
+              model: payload.model,
+              family,
+              price: {
+                in: payload.input_per_m ?? 0,
+                cached_in: payload.cached_input_per_m ?? 0,
+                out: payload.output_per_m ?? 0,
+              },
+              fallbacks: payload.fallbacks ?? [],
+            },
+          },
+        };
+        return mockStore.models;
+      }
+    ),
+
+  deleteModelProfile: (profileName: string) =>
+    request<ModelsConfig>(
+      `/api/settings/models/profiles/${encodeURIComponent(profileName)}`,
+      { method: "DELETE" },
+      () => {
+        const norm = `@${profileName.trim().replace(/^@+/, "")}`;
+        const nextProfiles = { ...mockStore.models.profiles };
+        delete nextProfiles[norm];
+        mockStore.models = { ...mockStore.models, profiles: nextProfiles };
+        return mockStore.models;
+      }
+    ),
+
+  getOpenAISubscriptionStatus: () =>
+    request<OpenAISubscriptionStatus>(
+      "/api/settings/subscriptions/openai",
+      undefined,
+      () => mockStore.openAiSub
+    ),
+
+  setOpenAISubscriptionEnabled: (enabled: boolean) =>
+    request<OpenAISubscriptionStatus>(
+      "/api/settings/subscriptions/openai",
+      { method: "PUT", body: JSON.stringify({ enabled }) },
+      () => {
+        mockStore.openAiSub = { ...mockStore.openAiSub, enabled };
+        if (mockStore.models.policies) {
+          mockStore.models.policies.allow_openai_subscription_cli = enabled;
+        }
+        return mockStore.openAiSub;
+      }
+    ),
+
+  testConnection: (payload: {
+    auth_source: "api_key" | "openai_subscription";
+    api_key_var?: string | null;
+    model: string;
+    prompt?: string;
+  }) =>
+    request<TestConnectionResponse>(
+      "/api/settings/test-connection",
+      { method: "POST", body: JSON.stringify(payload) },
+      () => ({
+        ok: false,
+        provider:
+          payload.auth_source === "openai_subscription"
+            ? "OpenAI Subscription (Codex CLI)"
+            : payload.api_key_var ?? "api_key",
+        model: payload.model,
+        transport:
+          payload.auth_source === "openai_subscription" ? "openai_codex_cli" : "openai_compat",
+        latency_ms: 0,
+        reply_preview: "",
+        error: "Demo preview mode — start Foundry daemon to test live provider or Codex CLI calls.",
+      })
+    ),
+
+  deleteApiKey: (name: string) =>
+    request<{ deleted: string }>(
+      `/api/settings/keys/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+      () => {
+        mockStore.keysStatus.keys = mockStore.keysStatus.keys.filter((k) => k.name !== name);
+        mockStore.roster.agents = mockStore.roster.agents.map((a) =>
+          a.api_key_var === name
+            ? { ...a, auth_source: "profile_default", api_key_var: null, model_name: null }
+            : a
+        );
+        return { deleted: name };
+      }
+    ),
+
+  getAgentRoster: () =>
+    request<AgentRosterConfig>(
+      "/api/settings/agents",
+      undefined,
+      () => mockStore.roster
+    ),
+
+  createAgentSlot: (payload: {
+    name: string;
+    layer: AgentLayer;
+    role: AgentRole;
+    domain?: string | null;
+    parent_id?: string | null;
+    model_profile: string;
+    auth_source?: AgentAuthSource;
+    api_key_var?: string | null;
+    model_name?: string | null;
+    enabled?: boolean;
+  }) =>
+    request<AgentRosterConfig>(
+      "/api/settings/agents",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
+          model_profile: normalizeProfileKey(payload.model_profile),
+        }),
+      },
+      () => {
+        const authSource: AgentAuthSource =
+          payload.auth_source ?? (payload.api_key_var ? "api_key" : "profile_default");
+        const slot: AgentSlotConfig = {
+          id: `l${payload.layer}_${Date.now()}`,
+          name: payload.name.trim(),
+          layer: payload.layer,
+          role: payload.role,
+          domain: payload.domain ?? null,
+          parent_id: payload.parent_id ?? null,
+          model_profile: normalizeProfileKey(payload.model_profile),
+          auth_source: authSource,
+          api_key_var: authSource === "api_key" ? payload.api_key_var ?? null : null,
+          model_name: payload.model_name ?? null,
+          enabled: payload.enabled ?? true,
+        };
+        mockStore.roster = { agents: [...mockStore.roster.agents, slot] };
+        return mockStore.roster;
+      }
+    ),
+
+  updateAgentSlot: (
+    agentId: string,
+    payload: {
+      name?: string;
+      layer?: AgentLayer;
+      role?: AgentRole;
+      domain?: string | null;
+      parent_id?: string | null;
+      model_profile?: string;
+      auth_source?: AgentAuthSource;
+      api_key_var?: string | null;
+      model_name?: string | null;
+      enabled?: boolean;
+      clear_api_key?: boolean;
+      clear_model_name?: boolean;
+      clear_parent?: boolean;
+      clear_domain?: boolean;
+    }
+  ) =>
+    request<AgentRosterConfig>(
+      `/api/settings/agents/${encodeURIComponent(agentId)}`,
+      { method: "PUT", body: JSON.stringify(payload) },
+      () => {
+        mockStore.roster = {
+          agents: mockStore.roster.agents.map((slot) => {
+            if (slot.id !== agentId) return slot;
+            const nextAuth: AgentAuthSource =
+              payload.auth_source ??
+              (payload.clear_api_key
+                ? "profile_default"
+                : payload.api_key_var
+                  ? "api_key"
+                  : slot.auth_source);
+            const nextKeyVar =
+              nextAuth === "api_key"
+                ? payload.clear_api_key
+                  ? null
+                  : payload.api_key_var !== undefined
+                    ? payload.api_key_var
+                    : slot.api_key_var
+                : null;
+            return {
+              ...slot,
+              ...(payload.name !== undefined ? { name: payload.name } : {}),
+              ...(payload.layer !== undefined ? { layer: payload.layer } : {}),
+              ...(payload.role !== undefined ? { role: payload.role } : {}),
+              ...(payload.clear_domain
+                ? { domain: null }
+                : payload.domain !== undefined
+                  ? { domain: payload.domain }
+                  : {}),
+              ...(payload.clear_parent
+                ? { parent_id: null }
+                : payload.parent_id !== undefined
+                  ? { parent_id: payload.parent_id }
+                  : {}),
+              ...(payload.model_profile !== undefined
+                ? { model_profile: normalizeProfileKey(payload.model_profile) }
+                : {}),
+              auth_source: nextAuth,
+              api_key_var: nextKeyVar,
+              ...(payload.clear_model_name
+                ? { model_name: null }
+                : payload.model_name !== undefined
+                  ? { model_name: payload.model_name }
+                  : {}),
+              ...(payload.enabled !== undefined ? { enabled: payload.enabled } : {}),
+            };
+          }),
+        };
+        return mockStore.roster;
+      }
+    ),
+
+  deleteAgentSlot: (agentId: string) =>
+    request<AgentRosterConfig>(
+      `/api/settings/agents/${encodeURIComponent(agentId)}`,
+      { method: "DELETE" },
+      () => {
+        mockStore.roster = {
+          agents: mockStore.roster.agents
+            .filter((slot) => slot.id !== agentId)
+            .map((slot) =>
+              slot.parent_id === agentId ? { ...slot, parent_id: null } : slot
+            ),
+        };
+        return mockStore.roster;
+      }
     ),
 
   getPreviewUrl: (runId: string, env: "local" | "staging" | "production" = "local") =>

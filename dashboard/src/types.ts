@@ -215,6 +215,7 @@ export interface ProviderConfig {
   transport: string;
   billing_mode: string;
   base_url: string | null;
+  key_ref?: string | null;
   family: string | null;
   data_tier: string;
 }
@@ -223,6 +224,12 @@ export interface ModelProfile {
   provider: string;
   model: string;
   family: string | null;
+  price?: {
+    in: number;
+    cached_in?: number;
+    out: number;
+  };
+  fallbacks?: string[];
 }
 
 export interface ModelsConfig {
@@ -232,6 +239,12 @@ export interface ModelsConfig {
     roles: Record<string, string>;
     project_default: string;
     global_default: string;
+  };
+  policies?: {
+    require_verifier_family_diversity?: boolean | string;
+    upgrade_on_attempt?: number;
+    benchmark_pin_models?: boolean;
+    allow_openai_subscription_cli?: boolean;
   };
 }
 
@@ -301,4 +314,146 @@ export interface BlackboardEvent {
   payload: Record<string, unknown>;
   created_at: string;
   published_at: string | null;
+}
+
+export interface MessageRecord {
+  id: string;
+  thread_id: string;
+  from_id: string;
+  to_id: string | null;
+  body: string;
+  created_at: string;
+}
+
+export interface ChatSessionSummary {
+  run_id: string;
+  title: string;
+  project_id: string;
+  phase: string;
+  message_count: number;
+  agent_count: number;
+  is_chat_session: boolean;
+  started_at: string;
+  ended_at: string | null;
+}
+
+export interface ChatRunCreatedResponse {
+  run: RunRecord;
+  chat: ChatSessionSummary;
+  messages: MessageRecord[];
+  agents: AgentRecord[];
+}
+
+export type AgentLayer = 1 | 2 | 3;
+
+export type AgentRole =
+  | "orchestrator"
+  | "lead"
+  | "implementer"
+  | "test_writer"
+  | "reviewer"
+  | "integration"
+  | "release";
+
+export type AgentAuthSource = "profile_default" | "api_key" | "openai_subscription";
+
+export interface AgentSlotConfig {
+  id: string;
+  name: string;
+  layer: AgentLayer;
+  role: AgentRole;
+  domain: string | null;
+  parent_id: string | null;
+  model_profile: string;
+  auth_source: AgentAuthSource;
+  api_key_var: string | null;
+  model_name: string | null;
+  enabled: boolean;
+}
+
+export interface AgentRosterConfig {
+  agents: AgentSlotConfig[];
+}
+
+export interface ApiKeyPublicRecord {
+  name: string;
+  provider: string;
+  provider_label: string;
+  key_ref: string;
+  masked_preview: string;
+  backend: "keyring" | "encrypted_vault";
+  assigned_agents: string[];
+  created_at: string;
+}
+
+export interface ApiKeysStatusResponse {
+  backend: "keyring" | "encrypted_vault";
+  vault_unlocked: boolean;
+  vault_exists: boolean;
+  keys: ApiKeyPublicRecord[];
+}
+
+export interface ProviderCatalogEntry {
+  id: string;
+  label: string;
+  default_provider_id: string;
+  transport: string;
+  billing_mode: string;
+  family: string;
+  default_base_url: string | null;
+  supports_tool_calling: boolean;
+  requires_api_key: boolean;
+  allow_custom_model: boolean;
+  models: string[];
+}
+
+export interface ProviderCatalogResponse {
+  providers: ProviderCatalogEntry[];
+}
+
+export interface KeyModelsResponse {
+  key_name: string;
+  provider: string;
+  provider_label: string;
+  models: string[];
+  source: "live_api" | "catalog_fallback";
+  detail: string | null;
+}
+
+export interface ModelProfileUpsertPayload {
+  profile_name: string;
+  auth_source: "provider_default" | "api_key" | "openai_subscription";
+  api_key_var?: string | null;
+  provider?: string | null;
+  model: string;
+  input_per_m?: number;
+  cached_input_per_m?: number;
+  output_per_m?: number;
+  fallbacks?: string[];
+}
+
+export interface OpenAISubscriptionStatus {
+  enabled: boolean;
+  cli_installed: boolean;
+  cli_path: string | null;
+  cli_version: string | null;
+  models: string[];
+  supports_tool_calling: boolean;
+  policy_note: string;
+  setup_hint: string;
+}
+
+export interface TestConnectionResponse {
+  ok: boolean;
+  provider: string;
+  model: string;
+  transport: string;
+  latency_ms: number;
+  reply_preview: string;
+  error: string | null;
+}
+
+export interface PurgeTestRunsResponse {
+  deleted_count: number;
+  deleted_run_ids: string[];
 }

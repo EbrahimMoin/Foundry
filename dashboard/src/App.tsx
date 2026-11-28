@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, MoreHorizontal } from "lucide-react";
+import { AlertTriangle, Bot, KeyRound, Layers, MoreHorizontal } from "lucide-react";
 import {
   api,
   isDaemonOnline,
@@ -9,32 +9,53 @@ import {
   setManualDemoMode,
   subscribeConnectionMode,
 } from "./api";
+import { AgentLayersStudio } from "./components/AgentLayersStudio";
 import { CommandDock, type InspectorSection } from "./components/CommandDock";
 import { ExecutionStream } from "./components/ExecutionStream";
 import { InspectorDrawer } from "./components/InspectorDrawer";
-import { SettingsModal } from "./components/SettingsModal";
+import { NewChatView } from "./components/NewChatView";
+import { SettingsModal, type SettingsTab } from "./components/SettingsModal";
 import { Sidebar, type PrimarySection } from "./components/Sidebar";
 import { TelemetryHub } from "./components/TelemetryHub";
 import { WorkspaceHub, type WorkspaceTab } from "./components/WorkspaceHub";
 import { useTheme } from "./hooks/useTheme";
 import type {
+  AgentAuthSource,
+  AgentLayer,
   AgentRecord,
+  AgentRole,
+  AgentRosterConfig,
+  ApiKeysStatusResponse,
   AutonomyConfig,
   AutonomyOverrides,
   BlackboardEvent,
+  ChatSessionSummary,
   ContractRecord,
   CostsSummaryResponse,
   DataPolicyConfig,
   DecisionRecord,
+  KeyModelsResponse,
+  MessageRecord,
   MetricsSummaryResponse,
+  ModelProfileUpsertPayload,
   ModelsConfig,
   NoteRecord,
+  OpenAISubscriptionStatus,
   ProjectSummary,
+  ProviderCatalogEntry,
   RunRecord,
   RuntimeSettingsResponse,
   TaskRecord,
+  TestConnectionResponse,
   WriteReservationRecord,
 } from "./types";
+
+const TEST_PROJECT_PREFIXES = ["live_p5_", "pgsaver_", "outbox_", "p4_"];
+
+function isTestProjectSlug(slug: string | undefined | null): boolean {
+  if (!slug) return false;
+  return TEST_PROJECT_PREFIXES.some((prefix) => slug.startsWith(prefix));
+}
 
 export function App() {
   const {
@@ -47,12 +68,14 @@ export function App() {
 
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [chats, setChats] = useState<ChatSessionSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [reservations, setReservations] = useState<WriteReservationRecord[]>([]);
   const [contracts, setContracts] = useState<ContractRecord[]>([]);
   const [decisions, setDecisions] = useState<DecisionRecord[]>([]);
+  const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [notes, setNotes] = useState<NoteRecord[]>([]);
   const [costs, setCosts] = useState<CostsSummaryResponse | null>(null);
   const [metrics, setMetrics] = useState<MetricsSummaryResponse | null>(null);
@@ -60,6 +83,11 @@ export function App() {
   const [autonomy, setAutonomy] = useState<AutonomyConfig | null>(null);
   const [dataPolicy, setDataPolicy] = useState<DataPolicyConfig | null>(null);
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsResponse | null>(null);
+  const [apiKeys, setApiKeys] = useState<ApiKeysStatusResponse | null>(null);
+  const [roster, setRoster] = useState<AgentRosterConfig | null>(null);
+  const [catalog, setCatalog] = useState<ProviderCatalogEntry[]>([]);
+  const [openAiSub, setOpenAiSub] = useState<OpenAISubscriptionStatus | null>(null);
+  const [keyModelsMap, setKeyModelsMap] = useState<Record<string, string[]>>({});
   const [events, setEvents] = useState<BlackboardEvent[]>([]);
 
   const [wsConnected, setWsConnected] = useState(false);
@@ -73,6 +101,7 @@ export function App() {
   const [workspaceKey, setWorkspaceKey] = useState(0);
   const [inspector, setInspector] = useState<InspectorSection | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>("general");
 
   const [error, setError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState("");
@@ -84,25 +113,53 @@ export function App() {
     window.requestAnimationFrame(() => setAnnouncement(message));
   }, []);
 
+  const openSettingsAt = useCallback((tab: SettingsTab = "general") => {
+    setSettingsInitialTab(tab);
+    setSettingsOpen(true);
+  }, []);
+
   const loadGlobal = useCallback(async () => {
     try {
       await probeDaemonHealth();
-      const [projs, runList, modCfg, autoCfg, policyCfg, rtCfg] = await Promise.all([
+      const [
+        projs,
+        runList,
+        chatList,
+        modCfg,
+        autoCfg,
+        policyCfg,
+        rtCfg,
+        keysCfg,
+        rosterCfg,
+        catalogResp,
+        subStatus,
+      ] = await Promise.all([
         api.listProjects(),
         api.listRuns(),
+        api.listChats(),
         api.getModels(),
         api.getAutonomy(),
         api.getDataPolicy(),
         api.getRuntimeSettings(),
+        api.getApiKeys(),
+        api.getAgentRoster(),
+        api.getProviderCatalog(),
+        api.getOpenAISubscriptionStatus(),
       ]);
       setProjects(projs);
       setRuns(runList);
+      setChats(chatList);
       setModels(modCfg);
       setAutonomy(autoCfg);
       setDataPolicy(policyCfg);
       setRuntimeSettings(rtCfg);
+      setApiKeys(keysCfg);
+      setRoster(rosterCfg);
+      setCatalog(catalogResp.providers);
+      setOpenAiSub(subStatus);
+      // Keep clean New Chat landing when selectedRunId is null; only clear if run disappeared
       setSelectedRunId((prev) =>
-        prev && runList.some((r) => r.id === prev) ? prev : (runList[0]?.id ?? null)
+        prev && runList.some((r) => r.id === prev) ? prev : null
       );
       setError(null);
     } catch (err) {
@@ -112,12 +169,13 @@ export function App() {
 
   const loadRunData = useCallback(async (runId: string) => {
     try {
-      const [ag, tk, resv, ctr, dec, runNotes, cst, met] = await Promise.all([
+      const [ag, tk, resv, ctr, dec, runMsgs, runNotes, cst, met] = await Promise.all([
         api.listAgents(runId),
         api.listTasks(runId),
         api.listReservations(runId),
         api.listContracts(runId),
         api.listDecisions(runId),
+        api.listMessages(runId),
         api.listNotes(runId),
         api.getCosts(runId),
         api.getMetrics(runId),
@@ -127,6 +185,7 @@ export function App() {
       setReservations(resv);
       setContracts(ctr);
       setDecisions(dec);
+      setMessages(runMsgs);
       setNotes(runNotes);
       setCosts(cst);
       setMetrics(met);
@@ -145,7 +204,6 @@ export function App() {
     return unsub;
   }, [loadGlobal]);
 
-  // Global keyboard shortcut: Ctrl+, / Cmd+, toggles centered Settings modal
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === ",") {
@@ -164,6 +222,7 @@ export function App() {
       setReservations([]);
       setContracts([]);
       setDecisions([]);
+      setMessages([]);
       setNotes([]);
       setCosts(null);
       setMetrics(null);
@@ -193,6 +252,8 @@ export function App() {
 
         if (
           ev.type.startsWith("run.") ||
+          ev.type.startsWith("chat.") ||
+          ev.type.startsWith("agent.") ||
           ev.type.startsWith("task.") ||
           ev.type.startsWith("decision.") ||
           ev.type.startsWith("contract.") ||
@@ -215,6 +276,57 @@ export function App() {
     await loadGlobal();
     if (selectedRunId) await loadRunData(selectedRunId);
   }, [loadGlobal, loadRunData, selectedRunId]);
+
+  const handleStartChat = async (payload: {
+    prompt: string;
+    project_id?: string;
+    autonomy_preset?: AutonomyConfig["preset"];
+  }) => {
+    try {
+      const created = await api.createRun(payload);
+      setRuns((prev) => [created.run, ...prev.filter((r) => r.id !== created.run.id)]);
+      setChats((prev) => [created.chat, ...prev.filter((c) => c.run_id !== created.run.id)]);
+      setAgents(created.agents);
+      setMessages(created.messages);
+      setSelectedRunId(created.run.id);
+      setSection("stream");
+      setError(null);
+      announce("Started new Foundry chat run");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDeleteChat = async (runId: string) => {
+    try {
+      await api.deleteRun(runId);
+      setChats((prev) => prev.filter((c) => c.run_id !== runId));
+      setRuns((prev) => prev.filter((r) => r.id !== runId));
+      if (selectedRunId === runId) {
+        setSelectedRunId(null);
+      }
+      setError(null);
+      announce("Deleted chat session");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handlePurgeTestRuns = async () => {
+    try {
+      const res = await api.purgeTestRuns();
+      const dropSet = new Set(res.deleted_run_ids);
+      setChats((prev) => prev.filter((c) => !dropSet.has(c.run_id)));
+      setRuns((prev) => prev.filter((r) => !dropSet.has(r.id)));
+      if (selectedRunId && dropSet.has(selectedRunId)) {
+        setSelectedRunId(null);
+      }
+      setError(null);
+      announce(`Cleared ${res.deleted_count} test runs`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const handlePause = async () => {
     if (!selectedRunId) return;
@@ -274,11 +386,216 @@ export function App() {
     }
   };
 
+  const handleUpsertProfile = async (payload: ModelProfileUpsertPayload) => {
+    try {
+      const updated = await api.upsertModelProfile(payload);
+      setModels(updated);
+      setError(null);
+      announce(`Saved model profile ${payload.profile_name}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  };
+
+  const handleDeleteProfile = async (profileName: string) => {
+    try {
+      const updated = await api.deleteModelProfile(profileName);
+      setModels(updated);
+      setError(null);
+      announce(`Deleted profile ${profileName}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const handleUpdateDataPolicy = async (patch: Partial<DataPolicyConfig>) => {
     try {
       const updated = await api.updateDataPolicy(patch);
       setDataPolicy(updated);
       announce("Updated data policy");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleUnlockVault = async (passphrase: string) => {
+    try {
+      const status = await api.unlockVault(passphrase);
+      setApiKeys(status);
+      setError(null);
+      announce("Vault unlocked");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  };
+
+  const handleSaveApiKey = async (payload: {
+    name: string;
+    secret: string;
+    provider: string;
+    passphrase?: string;
+  }) => {
+    try {
+      await api.saveApiKey(payload);
+      const updated = await api.getApiKeys();
+      setApiKeys(updated);
+      setError(null);
+      announce(`Saved API key ${payload.name}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  };
+
+  const handleDeleteApiKey = async (name: string) => {
+    try {
+      await api.deleteApiKey(name);
+      const [keysCfg, rosterCfg] = await Promise.all([api.getApiKeys(), api.getAgentRoster()]);
+      setApiKeys(keysCfg);
+      setRoster(rosterCfg);
+      setError(null);
+      announce(`Deleted API key ${name}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleFetchKeyModels = async (name: string): Promise<KeyModelsResponse> => {
+    try {
+      const res = await api.fetchKeyModels(name);
+      setKeyModelsMap((prev) => ({ ...prev, [res.key_name]: res.models }));
+      setError(null);
+      return res;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  };
+
+  const handleToggleOpenAiSub = async (enabled: boolean) => {
+    try {
+      const status = await api.setOpenAISubscriptionEnabled(enabled);
+      setOpenAiSub(status);
+      const updatedModels = await api.getModels();
+      setModels(updatedModels);
+      setError(null);
+      announce(enabled ? "OpenAI Subscription CLI enabled" : "OpenAI Subscription CLI disabled");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleTestConnection = async (payload: {
+    auth_source: "api_key" | "openai_subscription";
+    api_key_var?: string | null;
+    model: string;
+  }): Promise<TestConnectionResponse> => {
+    try {
+      const res = await api.testConnection(payload);
+      setError(null);
+      return res;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+      return {
+        ok: false,
+        provider: payload.api_key_var ?? payload.auth_source,
+        model: payload.model,
+        transport: payload.auth_source,
+        latency_ms: 0,
+        reply_preview: "",
+        error: msg,
+      };
+    }
+  };
+
+  const handleCreateAgentSlot = async (payload: {
+    name: string;
+    layer: AgentLayer;
+    role: AgentRole;
+    domain?: string | null;
+    parent_id?: string | null;
+    model_profile: string;
+    auth_source?: AgentAuthSource;
+    api_key_var?: string | null;
+    model_name?: string | null;
+    enabled?: boolean;
+  }) => {
+    try {
+      const updated = await api.createAgentSlot(payload);
+      setRoster(updated);
+      const keysCfg = await api.getApiKeys();
+      setApiKeys(keysCfg);
+      setError(null);
+      announce(`Added ${payload.name} to Layer ${payload.layer}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  };
+
+  const handleUpdateAgentSlot = async (
+    agentId: string,
+    payload: {
+      model_profile?: string;
+      auth_source?: AgentAuthSource;
+      api_key_var?: string | null;
+      model_name?: string | null;
+      clear_api_key?: boolean;
+      clear_model_name?: boolean;
+      enabled?: boolean;
+    }
+  ) => {
+    try {
+      const updated = await api.updateAgentSlot(agentId, payload);
+      setRoster(updated);
+      const keysCfg = await api.getApiKeys();
+      setApiKeys(keysCfg);
+      setError(null);
+      announce("Agent configuration updated");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDeleteAgentSlot = async (agentId: string) => {
+    try {
+      const updated = await api.deleteAgentSlot(agentId);
+      setRoster(updated);
+      const keysCfg = await api.getApiKeys();
+      setApiKeys(keysCfg);
+      setError(null);
+      announce("Removed agent from roster");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleAddRunAgent = async (
+    runId: string,
+    payload: {
+      role: AgentRole;
+      domain?: string | null;
+      parent_agent_id?: string | null;
+      model_profile: string;
+    }
+  ) => {
+    try {
+      const created = await api.addRunAgent(runId, payload);
+      setAgents((prev) => [...prev, created]);
+      announce(`Spawned ${payload.role} on run`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleRemoveRunAgent = async (runId: string, agentId: string) => {
+    try {
+      const updated = await api.removeRunAgent(runId, agentId);
+      setAgents((prev) => prev.map((a) => (a.id === agentId ? updated : a)));
+      announce("Removed agent from active run");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -319,24 +636,41 @@ export function App() {
     }
   };
 
-  const handlePostNote = async (text: string, kind: "note" | "gotcha" = "note") => {
+  const handleSendMessage = async (text: string, mode: "chat" | "ai" | "gotcha") => {
     if (!selectedRunId) return;
     try {
-      const created = await api.createNote(selectedRunId, text, kind);
-      setNotes((prev) =>
-        prev.some((n) => n.id === created.id) ? prev : [...prev, created]
-      );
+      if (mode === "gotcha") {
+        const created = await api.createNote(selectedRunId, text, "gotcha");
+        setNotes((prev) =>
+          prev.some((n) => n.id === created.id) ? prev : [...prev, created]
+        );
+        announce("Gotcha persisted to Blackboard");
+      } else {
+        const invokeAi = mode === "ai";
+        await api.postMessage(selectedRunId, text, "human", invokeAi);
+        const latestMsgs = await api.listMessages(selectedRunId);
+        setMessages(latestMsgs);
+        if (invokeAi) {
+          const cst = await api.getCosts(selectedRunId);
+          setCosts(cst);
+        }
+        announce(invokeAi ? "Orchestrator replied" : "Message sent");
+      }
       setSection("stream");
-      announce("Note persisted to Blackboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   };
 
   const activeRun = runs.find((r) => r.id === selectedRunId) ?? null;
+  const activeChat = chats.find((c) => c.run_id === selectedRunId) ?? null;
+  const cleanProject =
+    projects.find((p) => !isTestProjectSlug(p.id) && !isTestProjectSlug(p.name)) ?? null;
   const activeProject =
-    projects.find((p) => p.id === activeRun?.project_id) ?? projects[0] ?? null;
+    projects.find((p) => p.id === activeRun?.project_id) ?? cleanProject ?? null;
   const pendingDecisionsCount = decisions.filter((d) => d.status === "pending").length;
+  const enabledAgentCount = (roster?.agents ?? []).filter((a) => a.enabled).length;
+  const savedKeysCount = apiKeys?.keys.length ?? 0;
 
   return (
     <div
@@ -352,31 +686,103 @@ export function App() {
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
         activeSection={section}
         onSelectSection={(next) => {
+          if (next === "agents") {
+            openInspector("agents");
+            return;
+          }
           setSection(next);
           if (next === "workspace") {
             setWorkspaceInitialTab("overview");
             setWorkspaceKey((k) => k + 1);
           }
         }}
-        runs={runs}
+        chats={chats}
         selectedRunId={selectedRunId}
-        onSelectRun={setSelectedRunId}
+        onNewChat={() => {
+          setSelectedRunId(null);
+          setSection("stream");
+          setInspector(null);
+        }}
+        onSelectChat={(runId) => {
+          setSelectedRunId(runId);
+          setSection("stream");
+        }}
+        onDeleteChat={handleDeleteChat}
+        onPurgeTestRuns={handlePurgeTestRuns}
         pendingDecisions={pendingDecisionsCount}
+        enabledAgentCount={enabledAgentCount}
         theme={theme}
         onToggleTheme={handleToggleTheme}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => openSettingsAt("general")}
       />
 
       <main className="flex-1 min-w-0 flex flex-col h-full overflow-hidden relative">
+        {/* Accessible Right-Sidebar Workbench Triggers */}
         <div className="absolute top-3.5 right-4 z-10 flex items-center gap-1.5">
+          {(
+            [
+              {
+                key: "agents" as const,
+                label: `Agents (${enabledAgentCount})`,
+                icon: Layers,
+                title: "Open 3-layer Agents in right sidebar",
+              },
+              {
+                key: "keys" as const,
+                label: `API Keys (${savedKeysCount})`,
+                icon: KeyRound,
+                title: "Open API Keys & OpenAI Subscription CLI in right sidebar",
+              },
+              {
+                key: "models" as const,
+                label: "Models",
+                icon: Bot,
+                title: "Open editable Models in right sidebar",
+              },
+            ] as const
+          ).map((btn) => {
+            const Icon = btn.icon;
+            const active = inspector === btn.key;
+            return (
+              <button
+                key={btn.key}
+                type="button"
+                onClick={() => toggleInspector(btn.key)}
+                title={btn.title}
+                className="h-8 px-2.5 rounded-full border inline-flex items-center gap-1.5 text-[12px] transition-colors"
+                style={
+                  active
+                    ? {
+                        backgroundColor: "var(--bg-active)",
+                        borderColor: "var(--accent)",
+                        color: "var(--ink-primary)",
+                        fontWeight: 500,
+                      }
+                    : {
+                        backgroundColor: "var(--bg-surface)",
+                        borderColor: "var(--border-hairline)",
+                        color: "var(--ink-secondary)",
+                      }
+                }
+              >
+                <Icon className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
+                <span className="hidden sm:inline">{btn.label}</span>
+              </button>
+            );
+          })}
+
           <button
             type="button"
             onClick={() => toggleInspector("decisions")}
-            aria-label="Open run details and decisions"
-            title="Decisions, models, costs & outbox"
-            className="h-8 w-8 rounded-full flex items-center justify-center text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+            aria-label="Open run decisions, costs and outbox"
+            title="Decisions, costs & outbox"
+            className="h-8 w-8 rounded-full border flex items-center justify-center text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+            style={{
+              backgroundColor: "var(--bg-surface)",
+              borderColor: "var(--border-hairline)",
+            }}
           >
-            <MoreHorizontal className="w-[18px] h-[18px]" />
+            <MoreHorizontal className="w-[17px] h-[17px]" />
           </button>
         </div>
 
@@ -404,18 +810,33 @@ export function App() {
           </div>
         )}
 
-        {section === "stream" && (
+        {section === "stream" && !activeRun && (
+          <NewChatView
+            defaultProjectName={cleanProject?.name ?? "app"}
+            autonomy={autonomy}
+            roster={roster}
+            onAutonomyChange={async (preset) => handleAutonomyPatch({ preset })}
+            onOpenAgentsStudio={() => openInspector("agents")}
+            onStartChat={handleStartChat}
+          />
+        )}
+
+        {section === "stream" && activeRun && (
           <>
             <ExecutionStream
               project={activeProject}
               run={activeRun}
+              chatTitle={activeChat?.title ?? null}
+              agents={agents}
               tasks={tasks}
               reservations={reservations}
               decisions={decisions}
+              messages={messages}
               notes={notes}
               events={events}
               demoMode={demoMode}
-              onOpenSettings={() => setSettingsOpen(true)}
+              onOpenSettings={() => openSettingsAt("general")}
+              onOpenAgentsStudio={() => openInspector("agents")}
               onResolveDecision={handleResolveDecision}
               onOpenInspector={openInspector}
               onOpenWorkspaceTasks={() => {
@@ -436,7 +857,7 @@ export function App() {
               onPause={handlePause}
               onResume={handleResume}
               onStop={handleStop}
-              onPostNote={handlePostNote}
+              onSendMessage={handleSendMessage}
             />
           </>
         )}
@@ -452,20 +873,46 @@ export function App() {
             agents={agents}
             decisions={decisions}
             models={models}
+            roster={roster}
+            apiKeys={apiKeys}
+            catalog={catalog}
+            openAiSub={openAiSub}
+            keyModelsMap={keyModelsMap}
+            onCreateAgentSlot={handleCreateAgentSlot}
+            onUpdateAgentSlot={handleUpdateAgentSlot}
+            onDeleteAgentSlot={handleDeleteAgentSlot}
+            onAddRunAgent={handleAddRunAgent}
+            onRemoveRunAgent={handleRemoveRunAgent}
+            onOpenApiKeys={() => openInspector("keys")}
             onOpenDecisions={() => openInspector("decisions")}
             onAnnounce={announce}
           />
         )}
 
+        {section === "agents" && (
+          <AgentLayersStudio
+            roster={roster}
+            models={models}
+            apiKeys={apiKeys}
+            catalog={catalog}
+            openAiSub={openAiSub}
+            keyModelsMap={keyModelsMap}
+            activeRunId={selectedRunId}
+            runAgents={agents}
+            onCreateAgentSlot={handleCreateAgentSlot}
+            onUpdateAgentSlot={handleUpdateAgentSlot}
+            onDeleteAgentSlot={handleDeleteAgentSlot}
+            onAddRunAgent={handleAddRunAgent}
+            onRemoveRunAgent={handleRemoveRunAgent}
+            onOpenApiKeys={() => openInspector("keys")}
+          />
+        )}
+
         {section === "controls" && (
           <TelemetryHub
-            models={models}
-            dataPolicy={dataPolicy}
             costs={costs}
             metrics={metrics}
-            onUpdateRole={handleUpdateRole}
-            onUpdateDataPolicy={handleUpdateDataPolicy}
-            onOpenFullSettings={() => setSettingsOpen(true)}
+            onOpenModelsDrawer={() => openInspector("models")}
           />
         )}
       </main>
@@ -478,13 +925,32 @@ export function App() {
             setInspector(null);
             setSidebarCollapsed(false);
           }}
+          activeRunId={selectedRunId}
+          runAgents={agents}
+          roster={roster}
+          apiKeys={apiKeys}
+          catalog={catalog}
+          openAiSub={openAiSub}
+          keyModelsMap={keyModelsMap}
+          onCreateAgentSlot={handleCreateAgentSlot}
+          onUpdateAgentSlot={handleUpdateAgentSlot}
+          onDeleteAgentSlot={handleDeleteAgentSlot}
+          onAddRunAgent={handleAddRunAgent}
+          onRemoveRunAgent={handleRemoveRunAgent}
+          onUnlockVault={handleUnlockVault}
+          onSaveApiKey={handleSaveApiKey}
+          onDeleteApiKey={handleDeleteApiKey}
+          onFetchKeyModels={handleFetchKeyModels}
+          onToggleOpenAiSub={handleToggleOpenAiSub}
+          onTestConnection={handleTestConnection}
           decisions={decisions}
           onResolveDecision={handleResolveDecision}
           models={models}
           dataPolicy={dataPolicy}
           onUpdateRole={handleUpdateRole}
+          onUpsertProfile={handleUpsertProfile}
+          onDeleteProfile={handleDeleteProfile}
           onUpdateDataPolicy={handleUpdateDataPolicy}
-          onOpenFullSettings={() => setSettingsOpen(true)}
           costs={costs}
           metrics={metrics}
           events={events}
@@ -493,6 +959,7 @@ export function App() {
 
       <SettingsModal
         open={settingsOpen}
+        initialTab={settingsInitialTab}
         onClose={() => setSettingsOpen(false)}
         themePreference={themePreference}
         systemTheme={systemTheme}
@@ -505,11 +972,10 @@ export function App() {
         onReconnectDaemon={handleReconnectDaemon}
         autonomy={autonomy}
         onUpdateAutonomy={handleAutonomyPatch}
-        models={models}
-        onUpdateRole={handleUpdateRole}
         dataPolicy={dataPolicy}
         onUpdateDataPolicy={handleUpdateDataPolicy}
         runtimeSettings={runtimeSettings}
+        onOpenWorkbench={(target) => openInspector(target)}
       />
     </div>
   );

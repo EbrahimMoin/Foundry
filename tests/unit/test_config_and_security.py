@@ -48,7 +48,14 @@ def test_default_configs_round_trip_and_v14_invariants(tmp_path: Path) -> None:
     assert pcfg.budgets.per_run_max_llm_calls == 600
     assert pcfg.deploy.target == "local_compose"
     assert set(DecisionMode) == {"auto", "approve", "human"}
-    assert set(TransportKind) == {"openai_compat", "google_genai", "anthropic"}
+    assert set(TransportKind) == {
+        "openai_compat",
+        "google_genai",
+        "anthropic",
+        "openai_codex_cli",
+    }
+    assert mcfg.policies.allow_openai_subscription_cli is False
+    assert mcfg.providers["openai_subscription_cli"].supports_tool_calling is False
 
     f_path = save_foundry_config(gcfg, tmp_path / "foundry.yaml")
     m_path = save_models_config(mcfg, tmp_path / "models.yaml")

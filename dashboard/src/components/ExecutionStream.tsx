@@ -1,8 +1,11 @@
 import { useState } from "react";
-import { Check, Lock, MessageSquarePlus, Terminal, X } from "lucide-react";
+import { Check, Lock, MessageSquarePlus, X } from "lucide-react";
+import type { InspectorSection } from "./CommandDock";
 import type {
+  AgentRecord,
   BlackboardEvent,
   DecisionRecord,
+  MessageRecord,
   NoteRecord,
   ProjectSummary,
   RunRecord,
@@ -14,18 +17,22 @@ import { computeWaveProgress, formatShortTime, shortId } from "../utils/foundryM
 interface ExecutionStreamProps {
   project: ProjectSummary | null;
   run: RunRecord | null;
+  chatTitle: string | null;
+  agents: AgentRecord[];
   tasks: TaskRecord[];
   reservations: WriteReservationRecord[];
   decisions: DecisionRecord[];
+  messages: MessageRecord[];
   notes: NoteRecord[];
   events: BlackboardEvent[];
   demoMode: boolean;
   onOpenSettings: () => void;
+  onOpenAgentsStudio: () => void;
   onResolveDecision: (
     decisionId: string,
     body: { action: "approve" | "reject"; choice?: unknown; feedback?: string }
   ) => Promise<void>;
-  onOpenInspector: (section: "decisions" | "models" | "costs" | "outbox") => void;
+  onOpenInspector: (section: InspectorSection) => void;
   onOpenWorkspaceTasks: () => void;
 }
 
@@ -36,13 +43,17 @@ function formatOption(opt: string): string {
 export function ExecutionStream({
   project,
   run,
+  chatTitle,
+  agents,
   tasks,
   reservations,
   decisions,
+  messages,
   notes,
   events,
   demoMode,
   onOpenSettings,
+  onOpenAgentsStudio,
   onResolveDecision,
   onOpenInspector,
   onOpenWorkspaceTasks,
@@ -51,6 +62,8 @@ export function ExecutionStream({
   const [feedbackById, setFeedbackById] = useState<Record<string, string>>({});
   const [showNote, setShowNote] = useState<Record<string, boolean>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  if (!run) return null;
 
   const activeLocksByTask = new Map<string, WriteReservationRecord[]>();
   for (const r of reservations) {
@@ -70,7 +83,8 @@ export function ExecutionStream({
   );
   const pendingDecisions = decisions.filter((d) => d.status === "pending");
   const activeReservations = reservations.filter((r) => !r.released_at);
-  const projectLabel = run?.project_id ?? project?.name ?? "workspace";
+  const activeAgentsCount = agents.filter((a) => a.status !== "removed").length;
+  const projectLabel = run.project_id ?? project?.name ?? "workspace";
 
   const getActiveChoice = (d: DecisionRecord): string | undefined => {
     if (selectedChoice[d.id]) return selectedChoice[d.id];
@@ -95,60 +109,9 @@ export function ExecutionStream({
     }
   };
 
-  if (!run) {
-    return (
-      <div className="flex-1 min-h-0 overflow-y-auto px-6 sm:px-10 py-14 flex items-center justify-center">
-        <div className="max-w-[520px] text-center space-y-4">
-          <div
-            className="w-11 h-11 mx-auto rounded-2xl border flex items-center justify-center"
-            style={{
-              backgroundColor: "var(--bg-surface)",
-              borderColor: "var(--border-hairline)",
-              color: "var(--ink-muted)",
-            }}
-          >
-            <Terminal className="w-5 h-5" />
-          </div>
-          <h1 className="font-serif text-[26px] font-medium text-[var(--ink-primary)]">
-            No active Foundry runs yet
-          </h1>
-          <p className="font-serif text-[17px] leading-relaxed text-[var(--ink-secondary)]">
-            Connected cleanly to your local Foundry daemon for{" "}
-            <span className="font-semibold text-[var(--ink-primary)]">{projectLabel}</span>. Start
-            a run via the CLI or toggle sample data in Settings to inspect the full control plane.
-          </p>
-          <div className="pt-2 flex flex-wrap items-center justify-center gap-2.5">
-            <code
-              className="px-3.5 py-2 rounded-xl border font-mono text-[12px]"
-              style={{
-                backgroundColor: "var(--bg-surface)",
-                borderColor: "var(--border-hairline)",
-                color: "var(--ink-primary)",
-              }}
-            >
-              foundry run --goal "..."
-            </code>
-            <button
-              type="button"
-              onClick={onOpenSettings}
-              className="px-3.5 py-2 rounded-xl border text-[12.5px] font-medium hover:bg-[var(--bg-hover)] transition-colors"
-              style={{
-                backgroundColor: "var(--bg-surface)",
-                borderColor: "var(--border-hairline)",
-                color: "var(--accent)",
-              }}
-            >
-              Open Settings
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="flex-1 min-h-0 overflow-y-auto px-6 sm:px-10 py-8">
-      <div className="max-w-[660px] mx-auto space-y-7 pb-8">
+      <div className="max-w-[660px] mx-auto space-y-6 pb-8">
         {demoMode && (
           <div
             className="rounded-xl border px-3.5 py-2 flex items-center justify-between gap-3 text-[12px]"
@@ -158,92 +121,120 @@ export function ExecutionStream({
               color: "var(--ink-secondary)",
             }}
           >
-            <span>Viewing interactive sample run snapshot.</span>
+            <span>Viewing interactive sample snapshot.</span>
             <button
               type="button"
               onClick={onOpenSettings}
               className="font-medium hover:underline shrink-0"
               style={{ color: "var(--accent)" }}
             >
-              Configure in Settings
+              Settings
             </button>
           </div>
         )}
 
-        {/* Dynamic Editorial Run Summary (Newsreader Voice) */}
-        <div className="space-y-3">
-          {wave1 ? (
-            <p className="font-serif text-[20px] leading-[1.55] text-[var(--ink-primary)]">
-              {wave1.status === "merged" ? (
-                <>
-                  Wave 1 Foundation for{" "}
-                  <span className="font-semibold">{projectLabel}</span> is complete — all{" "}
-                  {wave1.merged} core tasks passed G1–G5 verification and merged cleanly to main.
-                </>
-              ) : (
-                <>
-                  Wave 1 Foundation for{" "}
-                  <span className="font-semibold">{projectLabel}</span> is{" "}
-                  {wave1.status} ({wave1.merged}/{wave1.total} merged) on run{" "}
-                  <span className="font-mono text-[14px]">{shortId(run.id, 12)}</span>.
-                </>
-              )}
-            </p>
-          ) : (
-            <p className="font-serif text-[20px] leading-[1.55] text-[var(--ink-primary)]">
-              Run <span className="font-mono text-[15px]">{shortId(run.id, 12)}</span> for{" "}
-              <span className="font-semibold">{projectLabel}</span> is currently in{" "}
-              <span className="font-semibold">{run.phase.replace(/_/g, " ")}</span>.
-            </p>
-          )}
-
-          {wave2 ? (
-            <p className="font-serif text-[18.5px] leading-[1.6] text-[var(--ink-secondary)]">
-              Wave 2 feature execution is {wave2.status} ({wave2.merged}/{wave2.total} merged,{" "}
-              {wave2.inFlight} in flight) with independent cross-family G3/G4 verification.
-            </p>
-          ) : tasks.length === 0 ? (
-            <p className="font-serif text-[18px] leading-[1.6] text-[var(--ink-secondary)]">
-              Waiting for the orchestrator and domain leads to register Wave 1 foundation tasks and
-              locked contracts on the Blackboard.
-            </p>
-          ) : null}
+        {/* Quiet Chat Header Metadata */}
+        <div
+          className="pb-3 border-b flex flex-wrap items-center justify-between gap-2 text-[12px] text-[var(--ink-muted)]"
+          style={{ borderColor: "var(--border-hairline)" }}
+        >
+          <div className="min-w-0 truncate">
+            <span className="font-medium text-[var(--ink-primary)]">
+              {chatTitle ?? projectLabel}
+            </span>
+            <span className="mx-1.5">·</span>
+            <span className="font-mono text-[11px]">{shortId(run.id, 12)}</span>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenAgentsStudio}
+            className="font-mono text-[11px] hover:underline"
+            style={{ color: "var(--accent)" }}
+          >
+            {activeAgentsCount} active agents
+          </button>
         </div>
 
-        {/* Active Task Digest */}
-        {(highlightedTasks.length > 0 || tasks.length > 0) && (
-          <div className="space-y-3.5">
-            {highlightedTasks.length > 0 && (
-              <>
-                <p className="font-serif text-[19px] leading-[1.55] text-[var(--ink-primary)]">
-                  Here is what agents are actively working on:
-                </p>
+        {/* Conversational Thread (Messages from `human_chat` thread) */}
+        {messages.map((msg) => {
+          const isHuman = msg.from_id === "human";
+          if (isHuman) {
+            return (
+              <div key={msg.id} className="flex justify-end">
+                <div
+                  className="max-w-[480px] rounded-2xl px-4 py-3 font-serif text-[17.5px] leading-[1.5] text-[var(--ink-primary)]"
+                  style={{ backgroundColor: "var(--bg-bubble)" }}
+                >
+                  {msg.body}
+                </div>
+              </div>
+            );
+          }
+          return (
+            <div key={msg.id} className="space-y-1">
+              <p className="font-serif text-[18.5px] leading-[1.6] text-[var(--ink-primary)]">
+                {msg.body}
+              </p>
+              {msg.created_at && (
+                <div className="text-[11px] font-mono text-[var(--ink-muted)]">
+                  orchestrator · {formatShortTime(msg.created_at)}
+                </div>
+              )}
+            </div>
+          );
+        })}
 
-                <ul className="space-y-3 pl-5 list-disc marker:text-[var(--ink-muted)]">
-                  {highlightedTasks.slice(0, 5).map((t) => {
-                    const locks = activeLocksByTask.get(t.id) ?? [];
-                    return (
-                      <li
-                        key={t.id}
-                        className="font-serif text-[17.5px] leading-[1.55] text-[var(--ink-primary)]"
-                      >
-                        <span className="font-semibold">{t.title}</span>
-                        <span className="text-[var(--ink-secondary)]">
-                          {" — "}
-                          {t.status.replace(/_/g, " ").toLowerCase()} (W{t.wave} {t.domain}
-                          {locks.length > 0
-                            ? `, locked ${locks[0].path.replace(/\/$/, "").split("/").pop()}`
-                            : ""}
-                          ).
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </>
+        {/* Wave Progress & Task Summary (Only shown once tasks exist for this run) */}
+        {tasks.length > 0 && (
+          <div className="space-y-3 pt-1">
+            {wave1 && (
+              <p className="font-serif text-[19px] leading-[1.55] text-[var(--ink-primary)]">
+                {wave1.status === "merged" ? (
+                  <>
+                    Wave 1 Foundation for{" "}
+                    <span className="font-semibold">{projectLabel}</span> is complete — all{" "}
+                    {wave1.merged} core tasks merged cleanly to main.
+                  </>
+                ) : (
+                  <>
+                    Wave 1 Foundation is {wave1.status} ({wave1.merged}/{wave1.total} merged).
+                  </>
+                )}
+              </p>
             )}
 
-            <div className="pt-1 text-center">
+            {wave2 && (
+              <p className="font-serif text-[18px] leading-[1.6] text-[var(--ink-secondary)]">
+                Wave 2 feature execution is {wave2.status} ({wave2.merged}/{wave2.total} merged,{" "}
+                {wave2.inFlight} in flight).
+              </p>
+            )}
+
+            {highlightedTasks.length > 0 && (
+              <ul className="space-y-2.5 pl-5 list-disc marker:text-[var(--ink-muted)]">
+                {highlightedTasks.slice(0, 4).map((t) => {
+                  const locks = activeLocksByTask.get(t.id) ?? [];
+                  return (
+                    <li
+                      key={t.id}
+                      className="font-serif text-[17px] leading-[1.55] text-[var(--ink-primary)]"
+                    >
+                      <span className="font-semibold">{t.title}</span>
+                      <span className="text-[var(--ink-secondary)]">
+                        {" — "}
+                        {t.status.replace(/_/g, " ").toLowerCase()} (W{t.wave} {t.domain}
+                        {locks.length > 0
+                          ? `, locked ${locks[0].path.replace(/\/$/, "").split("/").pop()}`
+                          : ""}
+                        ).
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            <div className="pt-0.5 text-center">
               <button
                 type="button"
                 onClick={onOpenWorkspaceTasks}
@@ -385,10 +376,7 @@ export function ExecutionStream({
                         disabled={isBusy}
                         onClick={() => handleDecision(d, "approve")}
                         className="h-9 px-4 rounded-full inline-flex items-center gap-1.5 text-[13px] font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
-                        style={{
-                          backgroundColor: "var(--accent)",
-                          color: "#ffffff",
-                        }}
+                        style={{ backgroundColor: "var(--accent)", color: "#ffffff" }}
                       >
                         <Check className="w-3.5 h-3.5" />
                         Approve
@@ -470,11 +458,11 @@ export function ExecutionStream({
           </div>
         )}
 
-        {/* Persisted Blackboard Operator Notes (Warm Sand Bubbles) */}
+        {/* Persisted Gotchas / Operator Notes */}
         {notes.map((note) => {
           const isGotcha = note.kind === "gotcha";
           return (
-            <div key={note.id} className="space-y-2">
+            <div key={note.id} className="space-y-1.5">
               <div className="flex justify-end">
                 <div
                   className="max-w-[440px] rounded-2xl px-4 py-3 font-serif text-[17px] leading-[1.5] text-[var(--ink-primary)]"
@@ -491,10 +479,9 @@ export function ExecutionStream({
                   {note.body}
                 </div>
               </div>
-              <p className="font-serif text-[16.5px] text-[var(--ink-secondary)]">
-                Noted — persisted to run{" "}
-                <span className="font-mono text-[13px]">{shortId(run.id, 12)}</span>
-                {note.created_at ? ` at ${formatShortTime(note.created_at)}.` : "."}
+              <p className="font-serif text-[15.5px] text-[var(--ink-muted)] text-right">
+                Logged to Blackboard
+                {note.created_at ? ` at ${formatShortTime(note.created_at)}` : ""}
               </p>
             </div>
           );
